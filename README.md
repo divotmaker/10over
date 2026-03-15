@@ -1,5 +1,9 @@
 # 10over
 
+[![CI](https://github.com/divotmaker/10over/actions/workflows/ci.yml/badge.svg)](https://github.com/divotmaker/10over/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/tenover.svg)](https://crates.io/crates/tenover)
+[![docs.rs](https://docs.rs/tenover/badge.svg)](https://docs.rs/tenover)
+
 ## Disclaimer
 
 This project is not affiliated with or endorsed by Garmin Ltd.
