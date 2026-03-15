@@ -1,0 +1,22 @@
+// Reconstructed from protocol analysis of the Garmin R10.
+// Container message for all Garmin Device Interface (GDI) protobuf services.
+//
+// Original proto2 uses `extensions 1 to 55` with extend blocks in separate files.
+// Prost does not support proto2 extensions, so extension fields are inlined here
+// at their original tag numbers.
+
+syntax = "proto2";
+
+package GDI.Proto.Smart;
+
+import "GDIEventSharing.proto";
+import "GDILaunchMonitor.proto";
+
+option optimize_for = LITE_RUNTIME;
+
+message Smart {
+  // Extension field 30: EventSharing service
+  optional GDI.Proto.EventSharing.EventSharingService event_sharing = 30;
+  // Extension field 38: LaunchMonitor service
+  optional GDI.Proto.LaunchMonitor.Service launch_monitor_service = 38;
+}

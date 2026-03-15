@@ -1,0 +1,215 @@
+// Reconstructed from protocol analysis of the Garmin R10.
+// Garmin R10 launch monitor protobuf protocol.
+//
+// Transport: BLE GATT → COBS framing → CRC-16 → GFDI msg 5043/5044 → this protobuf
+// Shot data is pushed via AlertDetails extension on AlertNotification (field 1001).
+
+syntax = "proto2";
+
+package GDI.Proto.LaunchMonitor;
+
+option optimize_for = LITE_RUNTIME;
+
+// Top-level service message — one field set per request/response exchange.
+message Service {
+  optional StatusRequest                 status_request          = 1;
+  optional StatusResponse                status_response         = 2;
+  optional WakeUpRequest                 wake_up_request         = 3;
+  optional WakeUpResponse                wake_up_response        = 4;
+  optional TiltRequest                   tilt_request            = 5;
+  optional TiltResponse                  tilt_response           = 6;
+  optional StartTiltCalibrationRequest   start_tilt_cal_request  = 7;
+  optional StartTiltCalibrationResponse  start_tilt_cal_response = 8;
+  optional ResetTiltCalibrationRequest   reset_tilt_cal_request  = 9;
+  optional ResetTiltCalibrationResponse  reset_tilt_cal_response = 10;
+  optional ShotConfigRequest             shot_config_request     = 11;
+  optional ShotConfigResponse            shot_config_response    = 12;
+}
+
+// --- Status ---
+
+message StatusRequest {
+}
+
+message StatusResponse {
+  optional State state = 1;
+}
+
+// --- Wake Up ---
+
+message WakeUpRequest {
+}
+
+message WakeUpResponse {
+  enum ResponseStatus {
+    SUCCESS       = 0;
+    ALREADY_AWAKE = 1;
+    UNKNOWN_ERROR = 2;
+  }
+  optional ResponseStatus status = 1;
+}
+
+// --- Tilt ---
+
+message TiltRequest {
+}
+
+message TiltResponse {
+  optional Tilt tilt = 1;
+}
+
+message Tilt {
+  optional float roll  = 1;  // degrees
+  optional float pitch = 2;  // degrees
+}
+
+// --- Tilt Calibration ---
+
+message StartTiltCalibrationRequest {
+}
+
+message StartTiltCalibrationResponse {
+  enum CalibrationStatus {
+    STARTED     = 0;
+    IN_PROGRESS = 1;
+    ERROR       = 2;
+  }
+  optional CalibrationStatus status = 1;
+}
+
+message ResetTiltCalibrationRequest {
+  optional bool should_reset = 1;
+}
+
+message ResetTiltCalibrationResponse {
+  enum Status {
+    CAN_RESET        = 1;
+    ALREADY_RESET    = 2;
+    RESET_SUCCESSFUL = 3;
+    CANNOT_RESET     = 4;
+  }
+  optional Status status = 1;
+}
+
+// --- Shot Configuration ---
+
+message ShotConfigRequest {
+  optional float temperature = 1;  // °C (Celsius)
+  optional float humidity    = 2;  // 0.0–1.0 (normalized, not percent)
+  optional float altitude    = 3;  // meters
+  optional float air_density = 4;  // kg/m³
+  optional float tee_range   = 5;  // yards
+}
+
+message ShotConfigResponse {
+  optional bool success = 1;
+}
+
+// --- Alert Details (shot data, pushed via event system) ---
+
+message AlertDetails {
+  optional State             state            = 1;
+  optional Metrics           metrics          = 2;
+  optional Error             error            = 3;
+  optional CalibrationStatus tilt_calibration = 4;
+}
+
+// --- Device State ---
+
+message State {
+  enum StateType {
+    STANDBY           = 0;
+    INTERFERENCE_TEST = 1;
+    WAITING           = 2;  // armed, waiting for shot
+    RECORDING         = 3;  // capturing shot data
+    PROCESSING        = 4;  // computing metrics
+    ERROR             = 5;
+  }
+  optional StateType state = 1;
+}
+
+// --- Calibration Status (tilt calibration alerts) ---
+
+message CalibrationStatus {
+  enum StatusType {
+    IN_BOUNDS               = 1;
+    RECALIBRATION_SUGGESTED = 2;
+    RECALIBRATION_REQUIRED  = 3;
+  }
+  enum CalibrationResult {
+    SUCCESS     = 0;
+    ERROR       = 1;
+    UNIT_MOVING = 2;
+  }
+  optional StatusType        status = 1;
+  optional CalibrationResult result = 2;
+}
+
+// --- Shot Metrics ---
+
+message Metrics {
+  enum ShotType {
+    PRACTICE = 0;
+    NORMAL   = 1;
+  }
+  optional uint32       shot_id       = 1;
+  optional ShotType     shot_type     = 2;
+  optional BallMetrics  ball_metrics  = 3;
+  optional ClubMetrics  club_metrics  = 4;
+  optional SwingMetrics swing_metrics = 5;
+}
+
+message BallMetrics {
+  enum SpinCalculationType {
+    RATIO       = 0;
+    BALL_FLIGHT = 1;
+    OTHER       = 2;
+    MEASURED    = 3;  // requires marked ball
+  }
+  enum GolfBallType {
+    UNKNOWN      = 0;
+    CONVENTIONAL = 1;  // standard unmarked ball
+    MARKED       = 2;  // marked ball (enables measured spin)
+  }
+  optional float                launch_angle          = 1;  // degrees
+  optional float                launch_direction      = 2;  // degrees
+  optional float                ball_speed            = 3;  // m/s
+  optional float                spin_axis             = 4;  // degrees
+  optional float                total_spin            = 5;  // RPM
+  optional SpinCalculationType  spin_calculation_type = 6;
+  optional GolfBallType         golf_ball_type        = 7;
+}
+
+message ClubMetrics {
+  optional float club_head_speed = 1;  // m/s
+  optional float club_angle_face = 2;  // degrees
+  optional float club_angle_path = 3;  // degrees
+  optional float attack_angle    = 4;  // degrees
+}
+
+message SwingMetrics {
+  optional uint32 back_swing_start_time   = 1;  // ms
+  optional uint32 down_swing_start_time   = 2;  // ms
+  optional uint32 impact_time             = 3;  // ms
+  optional uint32 follow_through_end_time = 4;  // ms
+  optional uint32 end_recording_time      = 5;  // ms
+}
+
+// --- Error ---
+
+message Error {
+  enum ErrorCode {
+    UNKNOWN          = 0;
+    OVERHEATING      = 1;
+    RADAR_SATURATION = 2;
+    PLATFORM_TILTED  = 3;
+  }
+  enum Severity {
+    WARNING = 0;
+    SERIOUS = 1;
+    FATAL   = 2;
+  }
+  optional ErrorCode code       = 1;
+  optional Severity  severity   = 2;
+  optional Tilt      deviceTilt = 3;
+}

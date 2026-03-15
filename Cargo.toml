@@ -1,0 +1,46 @@
+[package]
+name = "tenover"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+description = "Client library for the Garmin R10 launch monitor BLE/GFDI/protobuf protocol"
+repository = "https://github.com/divotmaker/10over"
+readme = "README.md"
+keywords = ["garmin", "r10", "golf", "launch-monitor"]
+categories = ["network-programming", "parser-implementations"]
+
+[features]
+default = ["ble"]
+ble = []
+serde = ["dep:serde"]
+frp = ["dep:flightrelay"]
+
+[dependencies]
+prost = "0.13"
+thiserror = "2"
+serde = { version = "1", features = ["derive"], optional = true }
+flightrelay = { version = "0.1.7", features = ["server"], optional = true }
+
+# BLE backend deps are target-conditional: only the right platform's deps
+# are compiled. The `ble` feature (default) controls whether the ble module
+# and transport backends are included in the build.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+libc = "0.2"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+btleplug = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+tokio-stream = "0.1"
+uuid = "1"
+
+[[bin]]
+name = "tenover-frp"
+required-features = ["ble", "frp"]
+
+[build-dependencies]
+prost-build = "0.13"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

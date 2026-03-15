@@ -1,0 +1,104 @@
+// Reconstructed from protocol analysis of the Garmin R10.
+// Event sharing service — alert subscriptions and notifications.
+// The R10 uses AlertType.LAUNCH_MONITOR (8) to push shot data.
+//
+// Original proto2 uses `extensions 1000 to max` on AlertNotification with
+// AlertDetails registered at field 1001 via extend block in GDILaunchMonitor.proto.
+// Prost does not support proto2 extensions, so the extension field is inlined.
+
+syntax = "proto2";
+
+package GDI.Proto.EventSharing;
+
+import "GDILaunchMonitor.proto";
+
+option optimize_for = LITE_RUNTIME;
+
+enum AlertType {
+  ACTIVITY_START              = 0;
+  ACTIVITY_STOP               = 1;
+  ACTIVITY_DISTANCE           = 2;
+  ACTIVITY_TIME               = 3;
+  ACTIVITY_AUTO_LAP           = 4;
+  ACTIVITY_MANUAL_LAP         = 5;
+  ACTIVITY_TRANSITION         = 6;
+  SWITCHER_STATUS_CHANGE      = 7;
+  LAUNCH_MONITOR              = 8;
+  NAVIGATION_UPDATE           = 9;
+  BREAK_PLANNER_STATE_CHANGE  = 10;
+  DRIVING_STATE_CHANGE        = 11;
+  BLUETOOTH_CLASSIC_STATE_CHANGE = 12;
+  GOLF_STATE_CHANGE           = 13;
+  RANGEFINDER_MEASUREMENT     = 14;
+  XERO_CHRONOGRAPH            = 15;
+  GOLF_CLUB_STATUS_CHANGE     = 16;
+  DIVE_READINESS_CHANGE       = 17;
+}
+
+message EventSharingService {
+  optional SubscribeRequest      subscribe_request   = 1;
+  optional SubscribeResponse     subscribe_response  = 2;
+  optional AlertNotification     alert_notification   = 3;
+  optional AlertSupportRequest   support_request      = 4;
+  optional AlertSupportResponse  support_response     = 5;
+}
+
+message AlertMessage {
+  optional AlertType type     = 1;
+  optional uint32    interval = 2;
+}
+
+message Sport {
+  required uint32 sport_fit_type     = 1;
+  required uint32 sport_fit_sub_type = 2;
+}
+
+message ActivityAlertDetails {
+  optional uint32 total_distance  = 1;
+  optional uint32 total_time      = 2;
+  optional uint32 lap_time        = 3;
+  optional uint32 average_pace    = 4;
+  optional Sport  sport_type      = 5;
+  optional uint32 est_finish_time = 6;
+  optional uint32 lap_number      = 7;
+  optional uint32 session_dist    = 8;
+  optional uint32 session_time    = 9;
+  optional uint32 local_time      = 10;
+  optional Sport  last_sport_type = 11;
+  optional uint32 interval_dist   = 12;
+  optional uint32 interval_time   = 13;
+}
+
+message SubscribeRequest {
+  repeated AlertMessage alerts          = 1;
+  optional uint32       target_distance = 2;
+}
+
+message AlertSupportRequest {
+}
+
+message SubscribeResponse {
+  message AlertStatusMessage {
+    enum Status {
+      SUCCESS = 0;
+      FAIL    = 1;
+    }
+    required Status       subscribe_status = 1;
+    optional AlertMessage type             = 2;
+  }
+  repeated AlertStatusMessage alert_status = 1;
+}
+
+message AlertSupportResponse {
+  repeated AlertType supported_alerts = 1;
+  repeated uint32    version_num      = 2;
+}
+
+message AlertNotification {
+  repeated AlertType           alert_type       = 1;
+  optional ActivityAlertDetails activity_details = 2;
+
+  // Extension field 1001: AlertDetails from LaunchMonitor
+  // (inlined — original proto2 used `extensions 1000 to max` + extend block)
+  optional GDI.Proto.LaunchMonitor.AlertDetails details = 1001;
+}
