@@ -16,11 +16,16 @@
 //! ```
 
 use std::io;
+use std::time::Instant;
 
 use crate::error::Error;
 use crate::gfdi::{self, GfdiFrame, StreamBuffer};
 use crate::multilink;
 use crate::proto::{self, DeviceError, DeviceState, ShotData, SmartEvent};
+
+/// How long to remember shot IDs for deduplication (seconds).
+/// R10 replays shots at 6x, and back-to-back shots can overlap.
+const SHOT_DEDUP_WINDOW_SECS: u64 = 60;
 
 /// Transport trait — the caller provides the BLE read/write implementation.
 ///
@@ -106,7 +111,8 @@ pub struct Client<T: Transport> {
     phase: Phase,
     stream_buf: StreamBuffer,
     req_id_counter: u16,
-    last_shot_id: Option<u32>,
+    /// Recent shot IDs with timestamps for dedup across overlapping replays.
+    recent_shots: Vec<(u32, Instant)>,
     last_state: Option<DeviceState>,
     read_buf: Vec<u8>,
     pending_event: Option<Event>,
@@ -130,7 +136,7 @@ impl<T: Transport> Client<T> {
             phase: Phase::Registering,
             stream_buf: StreamBuffer::new(),
             req_id_counter: 1,
-            last_shot_id: None,
+            recent_shots: Vec::new(),
             last_state: None,
             read_buf: vec![0u8; 512],
             pending_event: None,
@@ -338,15 +344,25 @@ impl<T: Transport> Client<T> {
                     if state == DeviceState::Waiting {
                         return Ok(Some(Event::Ready));
                     }
+                    // Device went to Standby while active — re-arm it.
+                    if state == DeviceState::Standby && self.phase == Phase::Active {
+                        self.send_wakeup()?;
+                    }
                     return Ok(Some(Event::StateChange(state)));
                 }
                 Ok(None)
             }
             SmartEvent::Shot(shot) => {
-                if self.last_shot_id == Some(shot.shot_id) {
+                let now = Instant::now();
+                // Prune shots older than the dedup window.
+                self.recent_shots.retain(|(_, t)| {
+                    now.duration_since(*t).as_secs() < SHOT_DEDUP_WINDOW_SECS
+                });
+                // Check if we've already seen this shot ID.
+                if self.recent_shots.iter().any(|(id, _)| *id == shot.shot_id) {
                     return Ok(None); // duplicate retransmit
                 }
-                self.last_shot_id = Some(shot.shot_id);
+                self.recent_shots.push((shot.shot_id, now));
                 Ok(Some(Event::Shot(shot)))
             }
             SmartEvent::Error(err) => Ok(Some(Event::DeviceError(err))),
