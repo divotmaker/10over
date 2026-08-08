@@ -43,6 +43,9 @@ fn main() {
                     eprintln!("handshake complete");
                 }
                 Event::Subscribed { .. } | Event::WakeUpResponse { .. } => {}
+                Event::ShotConfigResponse { success } => {
+                    eprintln!("shot config response: success={success}");
+                }
                 Event::Ready => {
                     if !ready_printed {
                         eprintln!("READY — waiting for shot");

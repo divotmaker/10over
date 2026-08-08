@@ -155,9 +155,7 @@ pub enum ErrorSeverity {
 /// Build a Subscribe(LAUNCH_MONITOR) Smart message.
 #[must_use]
 pub fn build_subscribe_request() -> Vec<u8> {
-    use event_sharing::{
-        AlertMessage, AlertType, EventSharingService, SubscribeRequest,
-    };
+    use event_sharing::{AlertMessage, AlertType, EventSharingService, SubscribeRequest};
     use smart::Smart;
 
     let subscribe = SubscribeRequest {
@@ -179,6 +177,59 @@ pub fn build_subscribe_request() -> Vec<u8> {
     let smart = Smart {
         event_sharing: Some(es),
         launch_monitor_service: None,
+    };
+
+    smart.encode_to_vec()
+}
+
+/// Environmental config sent to the R10 for its internal flight model.
+///
+/// All fields are optional in the protocol.
+#[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ShotConfig {
+    /// Ambient temperature (°C).
+    pub temperature: Option<f32>,
+    /// Relative humidity (0.0–1.0, not percent).
+    pub humidity: Option<f32>,
+    /// Altitude (meters).
+    pub altitude: Option<f32>,
+    /// Air density (kg/m³).
+    pub air_density: Option<f32>,
+    /// Distance from the device to the tee (yards).
+    pub tee_range: Option<f32>,
+}
+
+/// Build a ShotConfigRequest Smart message.
+#[must_use]
+pub fn build_shot_config_request(config: &ShotConfig) -> Vec<u8> {
+    use launch_monitor::{Service, ShotConfigRequest};
+    use smart::Smart;
+
+    let lm = Service {
+        status_request: None,
+        status_response: None,
+        wake_up_request: None,
+        wake_up_response: None,
+        tilt_request: None,
+        tilt_response: None,
+        start_tilt_cal_request: None,
+        start_tilt_cal_response: None,
+        reset_tilt_cal_request: None,
+        reset_tilt_cal_response: None,
+        shot_config_request: Some(ShotConfigRequest {
+            temperature: config.temperature,
+            humidity: config.humidity,
+            altitude: config.altitude,
+            air_density: config.air_density,
+            tee_range: config.tee_range,
+        }),
+        shot_config_response: None,
+    };
+
+    let smart = Smart {
+        event_sharing: None,
+        launch_monitor_service: Some(lm),
     };
 
     smart.encode_to_vec()
@@ -228,6 +279,8 @@ pub enum SmartEvent {
     Error(DeviceError),
     /// Calibration status update.
     CalibrationStatus { status: i32, result: i32 },
+    /// Shot config (environment/tee distance) response received.
+    ShotConfigResponse { success: bool },
     /// Launch monitor response (status, tilt, shot config, etc.).
     LaunchMonitorResponse,
     /// Unknown or unhandled Smart message.
@@ -245,10 +298,10 @@ pub fn decode_smart(pb_data: &[u8]) -> Result<SmartEvent, prost::DecodeError> {
     // EventSharing extension (field 30)
     if let Some(es) = &smart.event_sharing {
         if let Some(resp) = &es.subscribe_response {
-            let success = resp
-                .alert_status
-                .first()
-                .is_some_and(|s| s.subscribe_status() == event_sharing::subscribe_response::alert_status_message::Status::Success);
+            let success = resp.alert_status.first().is_some_and(|s| {
+                s.subscribe_status()
+                    == event_sharing::subscribe_response::alert_status_message::Status::Success
+            });
             return Ok(SmartEvent::SubscribeResponse { success });
         }
 
@@ -264,6 +317,11 @@ pub fn decode_smart(pb_data: &[u8]) -> Result<SmartEvent, prost::DecodeError> {
         if let Some(resp) = &lm.wake_up_response {
             return Ok(SmartEvent::WakeUpResponse {
                 status: resp.status.unwrap_or(0),
+            });
+        }
+        if let Some(resp) = &lm.shot_config_response {
+            return Ok(SmartEvent::ShotConfigResponse {
+                success: resp.success.unwrap_or(false),
             });
         }
         return Ok(SmartEvent::LaunchMonitorResponse);
@@ -398,7 +456,86 @@ mod tests {
         let data = build_wakeup_request();
         assert!(!data.is_empty());
         let smart = smart::Smart::decode(data.as_slice()).unwrap();
-        assert!(smart.launch_monitor_service.unwrap().wake_up_request.is_some());
+        assert!(
+            smart
+                .launch_monitor_service
+                .unwrap()
+                .wake_up_request
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn shot_config_request_encodes_tee_range() {
+        let config = ShotConfig {
+            tee_range: Some(2.3), // yards
+            ..ShotConfig::default()
+        };
+        let data = build_shot_config_request(&config);
+        let smart = smart::Smart::decode(data.as_slice()).unwrap();
+        let lm = smart.launch_monitor_service.unwrap();
+        let req = lm.shot_config_request.unwrap();
+        assert_eq!(req.tee_range, Some(2.3));
+        assert!(req.temperature.is_none());
+        assert!(req.humidity.is_none());
+        assert!(req.altitude.is_none());
+        assert!(req.air_density.is_none());
+    }
+
+    #[test]
+    fn shot_config_request_encodes_all_fields() {
+        let config = ShotConfig {
+            temperature: Some(21.0),
+            humidity: Some(0.45),
+            altitude: Some(120.0),
+            air_density: Some(1.2),
+            tee_range: Some(6.0),
+        };
+        let data = build_shot_config_request(&config);
+        let smart = smart::Smart::decode(data.as_slice()).unwrap();
+        let req = smart
+            .launch_monitor_service
+            .unwrap()
+            .shot_config_request
+            .unwrap();
+        assert_eq!(req.temperature, Some(21.0));
+        assert_eq!(req.humidity, Some(0.45));
+        assert_eq!(req.altitude, Some(120.0));
+        assert_eq!(req.air_density, Some(1.2));
+        assert_eq!(req.tee_range, Some(6.0));
+    }
+
+    #[test]
+    fn decode_shot_config_response() {
+        use launch_monitor::{Service, ShotConfigResponse};
+        use smart::Smart;
+
+        let lm = Service {
+            status_request: None,
+            status_response: None,
+            wake_up_request: None,
+            wake_up_response: None,
+            tilt_request: None,
+            tilt_response: None,
+            start_tilt_cal_request: None,
+            start_tilt_cal_response: None,
+            reset_tilt_cal_request: None,
+            reset_tilt_cal_response: None,
+            shot_config_request: None,
+            shot_config_response: Some(ShotConfigResponse {
+                success: Some(true),
+            }),
+        };
+        let smart = Smart {
+            event_sharing: None,
+            launch_monitor_service: Some(lm),
+        };
+
+        let event = decode_smart(&smart.encode_to_vec()).unwrap();
+        assert!(matches!(
+            event,
+            SmartEvent::ShotConfigResponse { success: true }
+        ));
     }
 
     #[test]
@@ -411,11 +548,11 @@ mod tests {
             ball_metrics: Some(BallMetrics {
                 launch_angle: Some(12.5),
                 launch_direction: Some(-1.2),
-                ball_speed: Some(67.0),    // m/s
-                spin_axis: Some(5.0),      // degrees
-                total_spin: Some(2800.0),  // RPM
+                ball_speed: Some(67.0),         // m/s
+                spin_axis: Some(5.0),           // degrees
+                total_spin: Some(2800.0),       // RPM
                 spin_calculation_type: Some(0), // RATIO
-                golf_ball_type: Some(1),   // CONVENTIONAL
+                golf_ball_type: Some(1),        // CONVENTIONAL
             }),
             club_metrics: Some(ClubMetrics {
                 club_head_speed: Some(44.0),
