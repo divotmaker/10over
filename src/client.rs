@@ -82,6 +82,8 @@ pub enum Event {
     Subscribed { success: bool },
     /// WakeUp response received.
     WakeUpResponse { status: i32 },
+    /// Shot config response received (environment/tee distance).
+    ShotConfigResponse { success: bool },
 }
 
 /// Client state machine phases.
@@ -333,6 +335,9 @@ impl<T: Transport> Client<T> {
                 }
                 Ok(Some(Event::WakeUpResponse { status }))
             }
+            SmartEvent::ShotConfigResponse { success } => {
+                Ok(Some(Event::ShotConfigResponse { success }))
+            }
             SmartEvent::StateChange(state) => {
                 let changed = self.last_state != Some(state);
                 self.last_state = Some(state);
@@ -365,6 +370,21 @@ impl<T: Transport> Client<T> {
             | SmartEvent::LaunchMonitorResponse
             | SmartEvent::Unknown => Ok(None),
         }
+    }
+
+    /// Send a `ShotConfig` message (environmental data and/or tee
+    /// distance from the device) to the R10.
+    ///
+    /// Safe to call in any phase; the device replies with
+    /// `Event::ShotConfigResponse`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on transport write failure.
+    pub fn send_shot_config(&mut self, config: &proto::ShotConfig) -> Result<(), Error> {
+        let pb_data = proto::build_shot_config_request(config);
+        let frame = gfdi::build_protobuf_request(self.next_req_id(), &pb_data);
+        self.send_frame(&frame)
     }
 
     fn send_subscribe(&mut self) -> Result<(), Error> {
@@ -403,6 +423,7 @@ impl<T: Transport> Client<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -480,5 +501,106 @@ mod tests {
         let event = client.poll().unwrap();
         assert!(matches!(event, Some(Event::Registered { handle: 1 })));
         assert_eq!(client.phase(), "wait_device_info");
+    }
+
+    #[test]
+    fn client_sends_shot_config() {
+        let transport = MockTransport::new();
+        let tx = Rc::clone(&transport.tx);
+        let mut client = Client::new(transport, 20);
+        client.start().unwrap();
+
+        let config = proto::ShotConfig {
+            tee_range: Some(2.3),
+            ..proto::ShotConfig::default()
+        };
+        client.send_shot_config(&config).unwrap();
+
+        let sent = tx.borrow();
+        assert!(!sent.is_empty());
+        // Reassemble chunks (handle byte prefix = 0 before registration).
+        let mut wire = Vec::new();
+        for chunk in sent.iter() {
+            assert_eq!(chunk[0], 0x00);
+            wire.extend_from_slice(&chunk[1..]);
+        }
+        // Strip the COBS 0x00 delimiters and parse the frame.
+        let cobs_data = &wire[1..wire.len() - 1];
+        let frame = crate::cobs::decode(cobs_data).unwrap();
+        let parsed = gfdi::parse_frame(&frame).unwrap();
+        assert_eq!(parsed.msg_type, gfdi::MSG_PROTOBUF_REQUEST);
+        let (_hdr, pb_data) = gfdi::parse_frag_header(&parsed.payload).unwrap();
+        let smart = proto::smart::Smart::decode(pb_data).unwrap();
+        let req = smart
+            .launch_monitor_service
+            .unwrap()
+            .shot_config_request
+            .unwrap();
+        assert_eq!(req.tee_range, Some(2.3));
+    }
+
+    #[test]
+    fn client_handles_shot_config_response() {
+        use proto::launch_monitor::{Service, ShotConfigResponse};
+        use proto::smart::Smart;
+
+        let transport = MockTransport::new();
+        let rx = Rc::clone(&transport.rx);
+        let mut client = Client::new(transport, 20);
+        client.start().unwrap();
+
+        // Advance past registration: success, handle=1.
+        rx.borrow_mut().push_back(vec![
+            0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01,
+            0x00, 0x00,
+        ]);
+        let event = client.poll().unwrap();
+        assert!(matches!(event, Some(Event::Registered { handle: 1 })));
+
+        // Build a 5044 ShotConfigResponse frame wrapped in COBS with handle.
+        let lm = Service {
+            status_request: None,
+            status_response: None,
+            wake_up_request: None,
+            wake_up_response: None,
+            tilt_request: None,
+            tilt_response: None,
+            start_tilt_cal_request: None,
+            start_tilt_cal_response: None,
+            reset_tilt_cal_request: None,
+            reset_tilt_cal_response: None,
+            shot_config_request: None,
+            shot_config_response: Some(ShotConfigResponse {
+                success: Some(false),
+            }),
+        };
+        let smart = Smart {
+            event_sharing: None,
+            launch_monitor_service: Some(lm),
+        }
+        .encode_to_vec();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u16.to_le_bytes()); // req_id
+        payload.extend_from_slice(&0u32.to_le_bytes()); // offset
+        #[allow(clippy::cast_possible_truncation)]
+        let len = smart.len() as u32;
+        payload.extend_from_slice(&len.to_le_bytes()); // total_len
+        payload.extend_from_slice(&len.to_le_bytes()); // chunk_size
+        payload.extend_from_slice(&smart);
+        let frame = gfdi::build_frame(gfdi::MSG_PROTOBUF_RESPONSE, &payload);
+
+        let mut wire = vec![0x00];
+        wire.extend_from_slice(&crate::cobs::encode(&frame));
+        wire.push(0x00);
+        let mut chunk = vec![1u8]; // handle
+        chunk.extend_from_slice(&wire);
+        rx.borrow_mut().push_back(chunk);
+
+        let event = client.poll().unwrap();
+        assert!(matches!(
+            event,
+            Some(Event::ShotConfigResponse { success: false })
+        ));
     }
 }
