@@ -22,5 +22,5 @@ pub use ble::{BleError, BleTransport};
 pub use client::{Client, Event, Transport};
 pub use error::Error;
 #[cfg(feature = "frp")]
-pub use frp::FrpServer;
+pub use frp::FrpDevice;
 pub use proto::ShotData;

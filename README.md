@@ -20,9 +20,10 @@ poll-based API:
   and state tracking automatically.
 - **`BleTransport`** — platform-agnostic BLE transport (`ble` feature, enabled
   by default). Auto-selects BlueZ on Linux or btleplug on Windows/macOS.
-- **`FrpServer`** — [Flight Relay Protocol](https://github.com/flightrelay/spec)
-  device server (`frp` feature). Bridges R10 shot data to any FRP controller
-  over WebSocket (port 5880).
+- **`FrpDevice`** — [Flight Relay Protocol](https://github.com/flightrelay/spec)
+  device (`frp` feature). Bridges R10 shot data to an FRP controller over
+  WebSocket, either serving controllers on a local port (default 5880) or
+  dialing a central controller such as flighthook.
 
 ## Legal Basis — DMCA Section 1201(f)
 

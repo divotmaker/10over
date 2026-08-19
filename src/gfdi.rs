@@ -109,7 +109,6 @@ impl StreamBuffer {
             });
         }
     }
-
 }
 
 // ── Frame parsing ──

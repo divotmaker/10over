@@ -1,48 +1,154 @@
-//! FRP device server — bridges 10over's R10 protocol to the
+//! FRP device adapter — bridges 10over's R10 protocol to the
 //! [Flight Relay Protocol](https://github.com/flightrelay/spec).
 //!
-//! Maps [`Event`]s from a connected R10 to FRP envelopes and streams them
-//! to any connected FRP controller over WebSocket (port 5880).
+//! Maps [`Event`]s from a connected R10 to FRP envelopes and streams them to an
+//! FRP controller. The adapter always plays the FRP [`Role::Device`]; the
+//! transport direction is the caller's choice:
+//!
+//! - [`FrpDevice::serve`] accepts controllers on a local port (default 5880)
+//! - [`FrpDevice::bridge`] dials a central controller such as flighthook
+//!
+//! Connections are established on a background thread so the caller's poll loop
+//! never blocks, and a dropped connection is re-established automatically.
 //!
 //! Requires the `frp` feature.
 
 mod convert;
 
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread;
+use std::time::Duration;
+
 use flightrelay::{
-    FrpConnection, FrpEnvelope, FrpEvent, FrpListener, FrpMessage, FrpProtocolMessage, ShotKey,
-    SPEC_VERSION,
+    EndpointConfig, FrpConnection, FrpEndpoint, FrpEnvelope, FrpEvent, FrpMessage,
+    FrpProtocolMessage, Role, SPEC_VERSION, ShotKey, Transport,
 };
 
 use crate::client::Event;
 
 pub use convert::{ball_flight, club_data};
 
-/// An FRP device server backed by an R10 connection.
+/// Backoff between failed connection attempts.
+const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// An FRP device backed by an R10 connection.
 ///
-/// Manages the FRP listener and converts [`Event`]s into FRP envelopes.
-/// The caller drives both the `Client` poll loop and this server in the
-/// same thread.
-pub struct FrpServer {
-    listener: FrpListener,
+/// Converts [`Event`]s into FRP envelopes and streams them to the connected
+/// controller. The caller drives both the `Client` poll loop and this adapter
+/// in the same thread.
+pub struct FrpDevice {
     conn: Option<FrpConnection>,
+    /// Signals the acceptor thread to establish a connection.
+    request: Sender<()>,
+    /// Receives established connections from the acceptor thread.
+    incoming: Receiver<FrpConnection>,
+    /// True while the acceptor thread is working on a connection.
+    pending: bool,
+    /// Last telemetry envelope, re-sent to each newly connected controller.
+    telemetry: Option<FrpEnvelope>,
     device: String,
     shot_number: u32,
 }
 
-impl FrpServer {
-    /// Bind the FRP listener on the given address (e.g. `"0.0.0.0:5880"`).
+impl FrpDevice {
+    /// Accept controllers on `addr` (e.g. `"0.0.0.0:5880"`).
     ///
     /// # Errors
     ///
     /// Returns an error if the TCP listener cannot bind.
-    pub fn bind(addr: &str) -> Result<Self, flightrelay::FrpError> {
-        let listener = FrpListener::bind(addr, &[SPEC_VERSION])?;
-        Ok(Self {
-            listener,
+    pub fn serve(addr: &str) -> Result<Self, flightrelay::FrpError> {
+        Self::spawn(EndpointConfig::new(Role::Device, Transport::listen(addr)))
+    }
+
+    /// Dial a central controller at `url` (e.g. `"ws://flighthook:5880/frp"`),
+    /// identifying as `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the endpoint cannot be opened.
+    pub fn bridge(url: &str, name: &str) -> Result<Self, flightrelay::FrpError> {
+        Self::spawn(
+            EndpointConfig::new(Role::Device, Transport::connect(url))
+                .with_name(name)
+                .with_versions(&[SPEC_VERSION]),
+        )
+    }
+
+    fn spawn(config: EndpointConfig) -> Result<Self, flightrelay::FrpError> {
+        let mut endpoint = FrpEndpoint::open(config)?;
+        let (request, request_rx) = mpsc::channel::<()>();
+        let (conn_tx, incoming) = mpsc::channel::<FrpConnection>();
+
+        thread::spawn(move || {
+            while request_rx.recv().is_ok() {
+                // Retry until connected — one request yields one connection.
+                loop {
+                    match endpoint.establish() {
+                        Ok(conn) if conn.set_nonblocking(true).is_ok() => {
+                            if conn_tx.send(conn).is_err() {
+                                return;
+                            }
+                            break;
+                        }
+                        // Back off so a refused dial or rejected handshake
+                        // does not spin the thread.
+                        _ => thread::sleep(RETRY_DELAY),
+                    }
+                }
+            }
+        });
+
+        let mut device = Self {
             conn: None,
+            request,
+            incoming,
+            pending: false,
+            telemetry: None,
             device: String::new(),
             shot_number: 0,
-        })
+        };
+        device.request_connection();
+        Ok(device)
+    }
+
+    /// Ask the acceptor thread for a connection, unless one is already pending.
+    fn request_connection(&mut self) {
+        if !self.pending && self.request.send(()).is_ok() {
+            self.pending = true;
+        }
+    }
+
+    /// Adopt a newly established connection, if one is ready.
+    ///
+    /// Call once per poll-loop iteration. Re-sends the cached telemetry
+    /// envelope to each newly connected controller, as the spec requires.
+    ///
+    /// Returns `true` when a connection was adopted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the telemetry re-send fails.
+    pub fn poll_connection(&mut self) -> Result<bool, flightrelay::FrpError> {
+        if self.conn.is_some() {
+            return Ok(false);
+        }
+        match self.incoming.try_recv() {
+            Ok(conn) => {
+                self.pending = false;
+                self.conn = Some(conn);
+                if let Some(env) = self.telemetry.clone() {
+                    self.send_envelope(&env)?;
+                }
+                Ok(true)
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(false),
+        }
+    }
+
+    /// Whether a controller is currently connected.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.conn.is_some()
     }
 
     /// Set the device name (e.g. `"Garmin R10 F5:D1:88:F6:90:5D"`).
@@ -50,49 +156,19 @@ impl FrpServer {
         name.clone_into(&mut self.device);
     }
 
-    /// Accept a controller connection (blocking).
-    ///
-    /// Replaces any existing connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the WebSocket handshake fails.
-    pub fn accept(&mut self) -> Result<(), flightrelay::FrpError> {
-        let conn = self.listener.accept()?;
-        conn.set_nonblocking(true)?;
-        self.conn = Some(conn);
-        Ok(())
-    }
-
-    /// Whether a controller is currently connected.
-    #[must_use]
-    pub fn has_controller(&self) -> bool {
-        self.conn.is_some()
-    }
-
-    /// Try to accept a new controller if none is connected (non-blocking).
-    ///
-    /// `FrpListener` does not support non-blocking accept, so this is a
-    /// no-op stub. For controller reconnect, restart the server or call
-    /// `accept()` from a background thread.
-    pub fn try_accept(&mut self) {
-        // FrpListener wraps TcpListener without exposing set_nonblocking,
-        // so non-blocking accept isn't possible without upstream changes.
-    }
-
     /// Poll for incoming controller commands (non-blocking).
     ///
     /// Returns a [`DetectionMode`](flightrelay::DetectionMode) if the
-    /// controller sent `set_detection_mode`. The R10 does not support
-    /// mode switching, so the caller can log and ignore this.
+    /// controller sent `set_detection_mode`. The R10 does not support mode
+    /// switching, so the caller can log and ignore this.
     pub fn check_controller(&mut self) -> Option<flightrelay::DetectionMode> {
         let conn = self.conn.as_mut()?;
         match conn.try_recv() {
             Ok(Some(FrpMessage::Protocol(FrpProtocolMessage::SetDetectionMode {
                 mode, ..
             }))) => mode,
-            Err(flightrelay::FrpError::Closed) => {
-                self.conn = None;
+            Err(_) => {
+                self.drop_connection();
                 None
             }
             _ => None,
@@ -105,31 +181,28 @@ impl FrpServer {
     ///
     /// Returns an error if the send fails.
     pub fn send_device_info(&mut self) -> Result<(), flightrelay::FrpError> {
+        self.send_ready(true)
+    }
+
+    /// Drop the current connection and ask for a replacement.
+    fn drop_connection(&mut self) {
+        self.conn = None;
+        self.request_connection();
+    }
+
+    /// Send one envelope, dropping the connection if the peer has gone away.
+    fn send_envelope(&mut self, env: &FrpEnvelope) -> Result<(), flightrelay::FrpError> {
         let Some(conn) = self.conn.as_mut() else {
             return Ok(());
         };
-
-        let mut telemetry = std::collections::HashMap::new();
-        telemetry.insert("ready".to_owned(), "true".to_owned());
-
-        let env = FrpEnvelope {
-            device: self.device.clone(),
-            event: FrpEvent::DeviceTelemetry {
-                manufacturer: Some("Garmin".to_owned()),
-                model: Some("Approach R10".to_owned()),
-                firmware: None,
-                telemetry: Some(telemetry),
-            },
-        };
-
-        conn.send_envelope(&env).or_else(|e| {
-            if matches!(e, flightrelay::FrpError::Closed) {
-                self.conn = None;
+        match conn.send_envelope(env) {
+            Ok(()) => Ok(()),
+            Err(flightrelay::FrpError::Closed) => {
+                self.drop_connection();
                 Ok(())
-            } else {
-                Err(e)
             }
-        })
+            Err(e) => Err(e),
+        }
     }
 
     /// Process a client [`Event`] and send any resulting FRP envelopes.
@@ -180,10 +253,6 @@ impl FrpServer {
     }
 
     fn send_ready(&mut self, ready: bool) -> Result<(), flightrelay::FrpError> {
-        let Some(conn) = self.conn.as_mut() else {
-            return Ok(());
-        };
-
         let mut telemetry = std::collections::HashMap::new();
         telemetry.insert("ready".to_owned(), ready.to_string());
 
@@ -197,34 +266,20 @@ impl FrpServer {
             },
         };
 
-        conn.send_envelope(&env).or_else(|e| {
-            if matches!(e, flightrelay::FrpError::Closed) {
-                self.conn = None;
-                Ok(())
-            } else {
-                Err(e)
-            }
-        })
+        self.telemetry = Some(env.clone());
+        self.send_envelope(&env)
     }
 
     fn send_events(&mut self, events: &[FrpEvent]) -> Result<(), flightrelay::FrpError> {
-        let Some(conn) = self.conn.as_mut() else {
-            return Ok(());
-        };
-
         for event in events {
+            if self.conn.is_none() {
+                return Ok(());
+            }
             let env = FrpEnvelope {
                 device: self.device.clone(),
                 event: event.clone(),
             };
-            match conn.send_envelope(&env) {
-                Ok(()) => {}
-                Err(flightrelay::FrpError::Closed) => {
-                    self.conn = None;
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
-            }
+            self.send_envelope(&env)?;
         }
         Ok(())
     }
@@ -271,10 +326,21 @@ fn uuid_v4() -> String {
 
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5],
-        bytes[6], bytes[7],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
     )
 }

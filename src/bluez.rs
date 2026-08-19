@@ -137,7 +137,11 @@ impl BlueZTransport {
         &self.device_address
     }
 
-    fn acquire_fds(conn: Connection, device_path: &str, device_address: String) -> Result<Self, BlueZError> {
+    fn acquire_fds(
+        conn: Connection,
+        device_path: &str,
+        device_address: String,
+    ) -> Result<Self, BlueZError> {
         let (path_2810, path_2820) = discover_characteristics(&conn, device_path)?;
 
         // AcquireNotify on 2810 → notify_fd (all inbound notifications)
@@ -207,9 +211,7 @@ fn find_r10(conn: &Connection) -> Result<(String, String), BlueZError> {
         let paired = prop_bool(props, "Paired");
 
         if name == R10_DEVICE_NAME && paired {
-            let address = prop_str(props, "Address")
-                .unwrap_or("")
-                .to_owned();
+            let address = prop_str(props, "Address").unwrap_or("").to_owned();
             return Ok((path.as_str().to_owned(), address));
         }
     }

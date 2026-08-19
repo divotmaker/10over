@@ -1,6 +1,6 @@
 [package]
 name = "tenover"
-version = "0.0.3"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
@@ -20,7 +20,7 @@ frp = ["dep:flightrelay"]
 prost = "0.13"
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
-flightrelay = { version = "0.1.7", features = ["server"], optional = true }
+flightrelay = { version = "0.2.1", features = ["transport"], optional = true }
 
 # BLE backend deps are target-conditional: only the right platform's deps
 # are compiled. The `ble` feature (default) controls whether the ble module

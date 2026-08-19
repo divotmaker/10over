@@ -1,16 +1,14 @@
 use std::io::Result;
 
 fn main() -> Result<()> {
-    prost_build::Config::new()
-        .btree_map(["."])
-        .compile_protos(
-            &[
-                "proto/GDISmart.proto",
-                "proto/GDIEventSharing.proto",
-                "proto/GDILaunchMonitor.proto",
-            ],
-            &["proto/"],
-        )?;
+    prost_build::Config::new().btree_map(["."]).compile_protos(
+        &[
+            "proto/GDISmart.proto",
+            "proto/GDIEventSharing.proto",
+            "proto/GDILaunchMonitor.proto",
+        ],
+        &["proto/"],
+    )?;
 
     // Declare custom cfg names so rustc doesn't warn about them.
     println!("cargo::rustc-check-cfg=cfg(ble_backend_bluez)");
