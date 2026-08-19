@@ -155,9 +155,7 @@ pub enum ErrorSeverity {
 /// Build a Subscribe(LAUNCH_MONITOR) Smart message.
 #[must_use]
 pub fn build_subscribe_request() -> Vec<u8> {
-    use event_sharing::{
-        AlertMessage, AlertType, EventSharingService, SubscribeRequest,
-    };
+    use event_sharing::{AlertMessage, AlertType, EventSharingService, SubscribeRequest};
     use smart::Smart;
 
     let subscribe = SubscribeRequest {
@@ -245,10 +243,10 @@ pub fn decode_smart(pb_data: &[u8]) -> Result<SmartEvent, prost::DecodeError> {
     // EventSharing extension (field 30)
     if let Some(es) = &smart.event_sharing {
         if let Some(resp) = &es.subscribe_response {
-            let success = resp
-                .alert_status
-                .first()
-                .is_some_and(|s| s.subscribe_status() == event_sharing::subscribe_response::alert_status_message::Status::Success);
+            let success = resp.alert_status.first().is_some_and(|s| {
+                s.subscribe_status()
+                    == event_sharing::subscribe_response::alert_status_message::Status::Success
+            });
             return Ok(SmartEvent::SubscribeResponse { success });
         }
 
@@ -398,7 +396,13 @@ mod tests {
         let data = build_wakeup_request();
         assert!(!data.is_empty());
         let smart = smart::Smart::decode(data.as_slice()).unwrap();
-        assert!(smart.launch_monitor_service.unwrap().wake_up_request.is_some());
+        assert!(
+            smart
+                .launch_monitor_service
+                .unwrap()
+                .wake_up_request
+                .is_some()
+        );
     }
 
     #[test]
@@ -411,11 +415,11 @@ mod tests {
             ball_metrics: Some(BallMetrics {
                 launch_angle: Some(12.5),
                 launch_direction: Some(-1.2),
-                ball_speed: Some(67.0),    // m/s
-                spin_axis: Some(5.0),      // degrees
-                total_spin: Some(2800.0),  // RPM
+                ball_speed: Some(67.0),         // m/s
+                spin_axis: Some(5.0),           // degrees
+                total_spin: Some(2800.0),       // RPM
                 spin_calculation_type: Some(0), // RATIO
-                golf_ball_type: Some(1),   // CONVENTIONAL
+                golf_ball_type: Some(1),        // CONVENTIONAL
             }),
             club_metrics: Some(ClubMetrics {
                 club_head_speed: Some(44.0),

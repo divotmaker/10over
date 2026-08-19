@@ -1,8 +1,17 @@
 #![allow(clippy::doc_markdown)]
-//! tenover-frp — FlightRelay Protocol device server for Garmin R10.
+//! tenover-frp — Flight Relay Protocol device for Garmin R10.
 //!
-//! Connects to a Garmin R10 over BLE, arms it, and serves shot data over
-//! FRP (WebSocket on port 5880) to any connected controller.
+//! Connects to a Garmin R10 over BLE, arms it, and streams shot data over FRP
+//! to a controller.
+//!
+//! ```text
+//! tenover-frp [frp-target]
+//! ```
+//!
+//! `frp-target` selects the transport direction. A `ws://` or `wss://` URL
+//! bridges this device to a central controller such as flighthook; anything
+//! else is a bind address that controllers connect to. Defaults to
+//! `0.0.0.0:5880`.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -10,31 +19,30 @@ use std::thread;
 use std::time::Duration;
 
 use tenover::ble::BleTransport;
-use tenover::frp::FrpServer;
+use tenover::frp::FrpDevice;
 use tenover::{Client, Event};
 
 fn main() -> ExitCode {
-    let frp_addr = std::env::args()
+    let frp_target = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "0.0.0.0:5880".to_owned());
+    let bridging = frp_target.starts_with("ws://") || frp_target.starts_with("wss://");
 
-    // Bind FRP server first so controllers can connect while we scan
-    let mut frp = match FrpServer::bind(&frp_addr) {
+    // Open the FRP endpoint first so it connects while we scan for the R10
+    let frp = if bridging {
+        eprintln!("tenover-frp: bridging to controller at {frp_target}");
+        FrpDevice::bridge(&frp_target, "tenover")
+    } else {
+        eprintln!("tenover-frp: serving controllers on {frp_target}");
+        FrpDevice::serve(&frp_target)
+    };
+    let mut frp = match frp {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tenover-frp: failed to bind FRP server: {e}");
+            eprintln!("tenover-frp: failed to open FRP endpoint: {e}");
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("tenover-frp: FRP server listening on {frp_addr}");
-
-    // Accept controller connection (blocking)
-    eprintln!("tenover-frp: waiting for FRP controller...");
-    if let Err(e) = frp.accept() {
-        eprintln!("tenover-frp: controller accept failed: {e}");
-        return ExitCode::FAILURE;
-    }
-    eprintln!("tenover-frp: controller connected");
 
     // Connect to R10
     eprintln!("tenover-frp: searching for Garmin R10...");
@@ -86,13 +94,8 @@ fn main() -> ExitCode {
                     Event::Shot(shot) => {
                         ready_printed = false;
                         shot_count += 1;
-                        let ball_mph = shot
-                            .ball
-                            .as_ref()
-                            .map_or(0.0, |b| b.ball_speed * 2.237);
-                        eprintln!(
-                            "tenover-frp: shot #{shot_count} — {ball_mph:.1} mph"
-                        );
+                        let ball_mph = shot.ball.as_ref().map_or(0.0, |b| b.ball_speed * 2.237);
+                        eprintln!("tenover-frp: shot #{shot_count} — {ball_mph:.1} mph");
                     }
                     Event::DeviceError(err) => {
                         eprintln!("tenover-frp: device error: {err:?}");
@@ -106,10 +109,19 @@ fn main() -> ExitCode {
 
                 // Check for controller commands
                 if let Some(mode) = frp.check_controller() {
-                    eprintln!("tenover-frp: mode request: {mode:?} (R10 does not support mode switching)");
+                    eprintln!(
+                        "tenover-frp: mode request: {mode:?} (R10 does not support mode switching)"
+                    );
                 }
             }
             Ok(None) => {
+                // Adopt a newly established controller connection
+                match frp.poll_connection() {
+                    Ok(true) => eprintln!("tenover-frp: controller connected"),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("tenover-frp: telemetry resend failed: {e}"),
+                }
+
                 thread::sleep(Duration::from_millis(5));
             }
             Err(tenover::Error::Transport(e)) => {

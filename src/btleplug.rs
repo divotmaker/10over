@@ -183,9 +183,10 @@ impl Transport for BtleplugTransport {
                 Ok(len)
             }
             Err(mpsc::TryRecvError::Empty) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "BLE background thread exited"))
-            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "BLE background thread exited",
+            )),
         }
     }
 
@@ -365,7 +366,9 @@ async fn is_r10(peripheral: &Peripheral) -> bool {
     }
 
     // Match by Garmin manufacturer ID.
-    props.manufacturer_data.contains_key(&GARMIN_MANUFACTURER_ID)
+    props
+        .manufacturer_data
+        .contains_key(&GARMIN_MANUFACTURER_ID)
 }
 
 /// Extract a string address from a btleplug peripheral.

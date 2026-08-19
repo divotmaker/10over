@@ -308,11 +308,7 @@ impl<T: Transport> Client<T> {
         Ok(None)
     }
 
-    fn handle_protobuf(
-        &mut self,
-        payload: &[u8],
-        _msg_type: u16,
-    ) -> Result<Option<Event>, Error> {
+    fn handle_protobuf(&mut self, payload: &[u8], _msg_type: u16) -> Result<Option<Event>, Error> {
         let (_hdr, pb_data) = gfdi::parse_frag_header(payload)?;
         let smart_event = proto::decode_smart(pb_data)?;
 
@@ -355,9 +351,8 @@ impl<T: Transport> Client<T> {
             SmartEvent::Shot(shot) => {
                 let now = Instant::now();
                 // Prune shots older than the dedup window.
-                self.recent_shots.retain(|(_, t)| {
-                    now.duration_since(*t).as_secs() < SHOT_DEDUP_WINDOW_SECS
-                });
+                self.recent_shots
+                    .retain(|(_, t)| now.duration_since(*t).as_secs() < SHOT_DEDUP_WINDOW_SECS);
                 // Check if we've already seen this shot ID.
                 if self.recent_shots.iter().any(|(id, _)| *id == shot.shot_id) {
                     return Ok(None); // duplicate retransmit
