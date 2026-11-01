@@ -15,7 +15,7 @@ The protocol stack:
 
 ```
 ┌──────────────────────────────────────────┐
-│  Protobuf (GDI Smart container)          │  Application messages
+│  Protobuf (envelope message)             │  Application messages
 ├──────────────────────────────────────────┤
 │  Protobuf fragmentation header (14B)     │  Multi-part reassembly
 ├──────────────────────────────────────────┤
@@ -279,12 +279,18 @@ N-2     2     crc (u16 LE)
 | ID | Name | Direction | Notes |
 |---|---|---|---|
 | 5000 | Acknowledgment | both | Response wrapper (Section 5.3) |
+| 5003 | File Transfer | both | Not used by the R10 client |
+| 5004 | File Data | both | Not used by the R10 client |
 | 5011 | FIT Definition | device → host | FIT protocol |
 | 5012 | FIT Data | device → host | FIT capabilities |
 | 5024 | Device Information | device → host | Binary, first handshake message |
 | 5043 | Protobuf Request | both | Protobuf payload (Section 8) |
 | 5044 | Protobuf Response | both | Protobuf payload (Section 8) |
 | 5050 | Configuration | both | Capability bitmap exchange |
+| 5101-5112 | Authentication | both | Pairing and session keys; not used by the R10 client |
+
+`tenover::gfdi` exports these as `MSG_*` constants (`MSG_AUTH` is the
+5101-5112 range).
 
 ---
 
@@ -336,7 +342,7 @@ messages.
 ### 7.2 FIT Capabilities (5011/5012)
 
 Device may send FIT Definition (5011) and FIT Data (5012) containing a
-`CapabilitiesMesg`. These messages are **independent** of the 5050
+FIT capabilities message. These messages are **independent** of the 5050
 handshake.
 
 **For R10 implementation**: ACK both with status byte `[0x00]` (success).
@@ -407,103 +413,94 @@ Offset  Size  Field
 R10 shot data is ~60-80 bytes — always fits in a single frame
 (`offset=0`, `total_length=chunk_size`).
 
-### 8.2 Smart Container
+### 8.2 Envelope
 
-All protobuf payloads are wrapped in a `GDI.Proto.Smart.Smart` message:
+Every protobuf payload is one `Envelope` message (`proto/envelope.proto`),
+which carries exactly one channel:
 
 ```protobuf
-message Smart {
-  extensions 1 to 55;
+message Envelope {
+  optional AlertChannel   alerts  = 30;
+  optional MonitorChannel monitor = 38;
 }
 ```
 
-R10-relevant extensions:
-
-| Field | Service | Purpose |
+| Field | Channel | Purpose |
 |---|---|---|
-| 30 | EventSharingService | Alert subscription and notification |
-| 38 | LaunchMonitorService | R10 wake-up, config, status |
+| 30 | `AlertChannel` | Alert subscription and notification |
+| 38 | `MonitorChannel` | R10 wake-up, config, status |
 
-### 8.3 EventSharing Service (extension field 30)
+Fields this schema does not declare are skipped when decoding.
+
+### 8.3 Alert Channel (envelope field 30)
 
 ```protobuf
-message EventSharingService {
-  optional SubscribeRequest     subscribe_request  = 1;
-  optional SubscribeResponse    subscribe_response = 2;
-  optional AlertNotification    alert_notification = 3;
+message AlertChannel {
+  optional SubscribeCommand subscribe        = 1;
+  optional SubscribeResult  subscribe_result = 2;
+  optional Notification     notification     = 3;
 }
 
-message SubscribeRequest {
-  repeated AlertMessage alerts = 1;
+message SubscribeCommand {
+  repeated TopicSelection topics = 1;
 }
 
-message AlertMessage {
-  optional AlertType type = 1;
+message TopicSelection {
+  optional Topic topic = 1;
 }
 
-enum AlertType {
-  ACTIVITY_START              = 0;
-  ACTIVITY_STOP               = 1;
-  ACTIVITY_DISTANCE           = 2;
-  ACTIVITY_TIME               = 3;
-  ACTIVITY_AUTO_LAP           = 4;
-  ACTIVITY_MANUAL_LAP         = 5;
-  ACTIVITY_TRANSITION         = 6;
-  SWITCHER_STATUS_CHANGE      = 7;
-  LAUNCH_MONITOR              = 8;   // R10 shot data
-  // 9-17: navigation, driving, golf, rangefinder, etc.
+enum Topic {
+  TOPIC_SHOT_DATA = 8;   // R10 shot data
 }
 
-message AlertNotification {
-  repeated AlertType alert_type = 1;
-  extensions 1000 to max;
-  // AlertDetails registered at field 1001
+message Notification {
+  repeated Topic         topics  = 1;
+  optional MonitorReport monitor = 1001;
 }
 ```
 
-### 8.4 LaunchMonitor Service (extension field 38)
+The schema is in `proto/alerts.proto`. Topic values other than
+`TOPIC_SHOT_DATA` decode as plain integers.
+
+### 8.4 Launch Monitor Channel (envelope field 38)
 
 ```protobuf
-message Service {
-  optional StatusRequest                 status_request          = 1;
-  optional StatusResponse                status_response         = 2;
-  optional WakeUpRequest                 wake_up_request         = 3;
-  optional WakeUpResponse                wake_up_response        = 4;
-  optional TiltRequest                   tilt_request            = 5;
-  optional TiltResponse                  tilt_response           = 6;
-  optional StartTiltCalibrationRequest   start_tilt_cal_request  = 7;
-  optional StartTiltCalibrationResponse  start_tilt_cal_response = 8;
-  optional ResetTiltCalibrationRequest   reset_tilt_cal_request  = 9;
-  optional ResetTiltCalibrationResponse  reset_tilt_cal_response = 10;
-  optional ShotConfigRequest             shot_config_request     = 11;
-  optional ShotConfigResponse            shot_config_response    = 12;
+message MonitorChannel {
+  optional StateQuery            state_query            = 1;
+  optional StateReply            state_reply            = 2;
+  optional WakeCommand           wake                   = 3;
+  optional WakeResult            wake_result            = 4;
+  optional LevelQuery            level_query            = 5;
+  optional LevelReply            level_reply            = 6;
+  optional LevelCalibrateCommand level_calibrate        = 7;
+  optional LevelCalibrateResult  level_calibrate_result = 8;
+  optional LevelClearCommand     level_clear            = 9;
+  optional LevelClearResult      level_clear_result     = 10;
+  optional EnvironmentSettings   environment            = 11;
+  optional EnvironmentResult     environment_result     = 12;
 }
 
-message WakeUpResponse {
-  enum ResponseStatus {
-    SUCCESS       = 0;
-    ALREADY_AWAKE = 1;
-    UNKNOWN_ERROR = 2;
+message WakeResult {
+  enum Outcome {
+    OUTCOME_WOKEN          = 0;
+    OUTCOME_ALREADY_ACTIVE = 1;
+    OUTCOME_FAILED         = 2;
   }
-  optional ResponseStatus status = 1;
+  optional Outcome outcome = 1;
 }
 ```
 
-### 8.5 AlertDetails (extension field 1001 on AlertNotification)
+### 8.5 Monitor Report (field 1001 of Notification)
 
-Shot data and state changes are delivered as `AlertDetails` within
-`AlertNotification` messages:
+Shot data and state changes are delivered as a `MonitorReport` inside
+alert-channel `Notification` messages:
 
 ```protobuf
-message AlertDetails {
-  optional State             state            = 1;
-  optional Metrics           metrics          = 2;
-  optional Error             error            = 3;
-  optional CalibrationStatus tilt_calibration = 4;
-
-  extend AlertNotification {
-    optional AlertDetails details = 1001;
-  }
+message MonitorReport {
+  optional DeviceStatus status = 1;
+  optional ShotReadout  shot   = 2;
+  optional Fault        fault  = 3;
+  optional LevelCheck   level  = 4;
 }
 ```
 
@@ -511,70 +508,70 @@ message AlertDetails {
 
 ## 9. Shot Data
 
-Shot data arrives via `AlertDetails.metrics` within an `AlertNotification`
-pushed by the device (GFDI 5043).
+Shot data arrives in `MonitorReport.shot` within a `Notification` pushed by
+the device (GFDI 5043).
 
-### 9.1 Metrics
+### 9.1 ShotReadout
 
 ```protobuf
-message Metrics {
-  enum ShotType {
-    PRACTICE = 0;
-    NORMAL   = 1;
+message ShotReadout {
+  enum Kind {
+    KIND_WARMUP  = 0;
+    KIND_REGULAR = 1;
   }
-  optional uint32       shot_id       = 1;
-  optional ShotType     shot_type     = 2;
-  optional BallMetrics  ball_metrics  = 3;
-  optional ClubMetrics  club_metrics  = 4;
-  optional SwingMetrics swing_metrics = 5;
+  optional uint32       shot_number = 1;
+  optional Kind         kind        = 2;
+  optional BallLaunch   ball        = 3;
+  optional ClubDelivery club        = 4;
+  optional SwingTiming  timing      = 5;
 }
 ```
 
-### 9.2 BallMetrics
+### 9.2 BallLaunch
 
 ```protobuf
-message BallMetrics {
-  enum SpinCalculationType {
-    RATIO       = 0;
-    BALL_FLIGHT = 1;
-    OTHER       = 2;
-    MEASURED    = 3;   // requires marked ball
+message BallLaunch {
+  enum SpinSource {
+    SPIN_SOURCE_ESTIMATED    = 0;
+    SPIN_SOURCE_FLIGHT_MODEL = 1;
+    SPIN_SOURCE_UNCLASSIFIED = 2;
+    SPIN_SOURCE_DIRECT       = 3;  // read off a marked ball
   }
-  enum GolfBallType {
-    UNKNOWN      = 0;
-    CONVENTIONAL = 1;  // standard unmarked ball
-    MARKED       = 2;  // marked ball (enables measured spin)
+  enum Marking {
+    MARKING_UNSPECIFIED = 0;
+    MARKING_PLAIN       = 1;  // unmarked ball
+    MARKING_DOTTED      = 2;  // marked ball (enables measured spin)
   }
-  optional float                launch_angle          = 1;  // degrees (VLA)
-  optional float                launch_direction      = 2;  // degrees (HLA)
-  optional float                ball_speed            = 3;  // m/s
-  optional float                spin_axis             = 4;  // degrees
-  optional float                total_spin            = 5;  // RPM
-  optional SpinCalculationType  spin_calculation_type = 6;
-  optional GolfBallType         golf_ball_type        = 7;
+  optional float      vertical_angle_deg   = 1;  // degrees (VLA)
+  optional float      horizontal_angle_deg = 2;  // degrees (HLA)
+  optional float      speed_mps            = 3;  // m/s
+  optional float      spin_tilt_deg        = 4;  // degrees (spin axis)
+  optional float      spin_rpm             = 5;  // RPM (total spin)
+  optional SpinSource spin_source          = 6;
+  optional Marking    marking              = 7;
 }
 ```
 
-### 9.3 ClubMetrics
+### 9.3 ClubDelivery
 
 ```protobuf
-message ClubMetrics {
-  optional float club_head_speed = 1;  // m/s
-  optional float club_angle_face = 2;  // degrees
-  optional float club_angle_path = 3;  // degrees
-  optional float attack_angle    = 4;  // degrees
+message ClubDelivery {
+  optional float head_speed_mps = 1;  // m/s
+  optional float face_deg       = 2;  // degrees
+  optional float path_deg       = 3;  // degrees
+  optional float attack_deg     = 4;  // degrees
 }
 ```
 
-### 9.4 SwingMetrics
+### 9.4 SwingTiming
 
 ```protobuf
-message SwingMetrics {
-  optional uint32 back_swing_start_time   = 1;  // ms (absolute device time)
-  optional uint32 down_swing_start_time   = 2;  // ms (absolute device time)
-  optional uint32 impact_time             = 3;  // ms (absolute device time)
-  optional uint32 follow_through_end_time = 4;  // ms (absolute device time)
-  optional uint32 end_recording_time      = 5;  // ms (absolute device time)
+message SwingTiming {
+  optional uint32 takeaway    = 1;  // ms (absolute device time)
+  optional uint32 transition  = 2;  // ms (absolute device time)
+  optional uint32 impact      = 3;  // ms (absolute device time)
+  optional uint32 finish      = 4;  // ms (absolute device time)
+  optional uint32 capture_end = 5;  // ms (absolute device time)
 }
 ```
 
@@ -582,88 +579,88 @@ message SwingMetrics {
 
 | Field | Unit | Notes |
 |---|---|---|
-| ball_speed | m/s | Multiply by 2.237 for mph |
-| club_head_speed | m/s | Same conversion |
-| launch_angle | degrees | Vertical launch angle |
-| launch_direction | degrees | Horizontal launch angle |
-| spin_axis | degrees | Decompose: `backspin = total_spin * cos(spin_axis)`, `sidespin = total_spin * sin(spin_axis)` |
-| total_spin | RPM | |
-| club_angle_face | degrees | Face angle at impact |
-| club_angle_path | degrees | Club path |
-| attack_angle | degrees | Angle of attack |
+| speed_mps | m/s | Ball speed. Multiply by 2.237 for mph |
+| head_speed_mps | m/s | Club head speed. Same conversion |
+| vertical_angle_deg | degrees | Vertical launch angle |
+| horizontal_angle_deg | degrees | Horizontal launch angle |
+| spin_tilt_deg | degrees | Spin axis. Decompose: `backspin = spin_rpm * cos(spin_tilt)`, `sidespin = spin_rpm * sin(spin_tilt)` |
+| spin_rpm | RPM | Total spin |
+| face_deg | degrees | Face angle at impact |
+| path_deg | degrees | Club path |
+| attack_deg | degrees | Angle of attack |
 | swing timing | ms | Absolute timestamps (ms since device boot) |
 
 ### 9.6 Observations from Live Device
 
-- Club face/path/attack_angle all 0.0 on slow swings — R10 needs minimum club
+- Club face/path/attack angle all 0.0 on slow swings — R10 needs minimum club
   speed to track club data
-- `spin_calculation_type` is always RATIO with an unmarked ball
-- `follow_through_end_time` occasionally reports sentinel values (~4.3 billion ms)
-  when follow-through was not tracked
-- Device retransmits unACK'd alerts; deduplicate by `shot_id`
+- `spin_source` is always `SPIN_SOURCE_ESTIMATED` with an unmarked ball
+- `finish` occasionally reports sentinel values (~4.3 billion ms) when
+  follow-through was not tracked
+- Device retransmits unACK'd alerts; deduplicate by `shot_number`
 
 ---
 
 ## 10. Device State
 
 ```protobuf
-message State {
-  enum StateType {
-    STANDBY           = 0;
-    INTERFERENCE_TEST = 1;
-    WAITING           = 2;  // armed, waiting for shot
-    RECORDING         = 3;  // capturing shot data
-    PROCESSING        = 4;  // computing metrics
-    ERROR             = 5;
+message DeviceStatus {
+  enum Phase {
+    PHASE_IDLE        = 0;
+    PHASE_NOISE_CHECK = 1;
+    PHASE_ARMED       = 2;  // waiting for a shot
+    PHASE_CAPTURING   = 3;  // recording a shot
+    PHASE_ANALYZING   = 4;  // computing metrics
+    PHASE_FAULTED     = 5;
   }
-  optional StateType state = 1;
+  optional Phase phase = 1;
 }
 ```
 
 State transitions during normal operation:
 
 ```
-STANDBY → INTERFERENCE_TEST → WAITING → RECORDING → PROCESSING → WAITING (loop)
+IDLE (0) → NOISE_CHECK (1) → ARMED (2) → CAPTURING (3) → ANALYZING (4) → ARMED (loop)
 ```
 
-The R10 auto-returns to WAITING after each shot — no re-arm required.
+The R10 auto-returns to ARMED after each shot — no re-arm required.
 
 ---
 
-## 11. Error Messages
+## 11. Faults
 
 ```protobuf
-message Error {
-  enum ErrorCode {
-    UNKNOWN          = 0;
-    OVERHEATING      = 1;
-    RADAR_SATURATION = 2;
-    PLATFORM_TILTED  = 3;
+message Fault {
+  enum Cause {
+    CAUSE_UNSPECIFIED     = 0;
+    CAUSE_TOO_HOT         = 1;
+    CAUSE_SIGNAL_OVERLOAD = 2;  // radar saturated
+    CAUSE_NOT_LEVEL       = 3;  // device tilted
   }
-  enum Severity {
-    WARNING = 0;
-    SERIOUS = 1;
-    FATAL   = 2;
+  enum Urgency {
+    URGENCY_LOW      = 0;
+    URGENCY_HIGH     = 1;
+    URGENCY_CRITICAL = 2;
   }
-  optional ErrorCode code       = 1;
-  optional Severity  severity   = 2;
-  optional Tilt      deviceTilt = 3;
+  optional Cause       cause       = 1;
+  optional Urgency     urgency     = 2;
+  optional Orientation orientation = 3;
 }
 ```
 
 ---
 
-## 12. Shot Configuration (Optional)
+## 12. Environment Settings (Optional)
 
 Environmental data sent to the device before or during a session:
 
 ```protobuf
-message ShotConfigRequest {
-  optional float temperature = 1;  // Celsius
-  optional float humidity    = 2;  // 0.0-1.0 (normalized, not percent)
-  optional float altitude    = 3;  // meters
-  optional float air_density = 4;  // kg/m^3
-  optional float tee_range   = 5;  // yards
+message EnvironmentSettings {
+  optional float air_temperature_c = 1;  // Celsius
+  optional float relative_humidity = 2;  // 0.0-1.0 (fraction, not percent)
+  optional float elevation_m       = 3;  // meters
+  optional float air_density_kg_m3 = 4;  // kg/m^3
+  optional float tee_distance_yd   = 5;  // yards from device to tee
 }
 ```
 
@@ -672,27 +669,27 @@ device's internal flight model.
 
 ---
 
-## 13. Tilt and Calibration
+## 13. Leveling
 
 ```protobuf
-message Tilt {
-  optional float roll  = 1;  // degrees
-  optional float pitch = 2;  // degrees
+message Orientation {
+  optional float roll_deg  = 1;  // degrees
+  optional float pitch_deg = 2;  // degrees
 }
 
-message CalibrationStatus {
-  enum StatusType {
-    IN_BOUNDS               = 1;
-    RECALIBRATION_SUGGESTED = 2;
-    RECALIBRATION_REQUIRED  = 3;
+message LevelCheck {
+  enum Verdict {
+    VERDICT_LEVEL           = 1;
+    VERDICT_RELEVEL_ADVISED = 2;
+    VERDICT_RELEVEL_NEEDED  = 3;
   }
-  enum CalibrationResult {
-    SUCCESS     = 0;
-    ERROR       = 1;
-    UNIT_MOVING = 2;
+  enum Attempt {
+    ATTEMPT_OK           = 0;
+    ATTEMPT_FAILED       = 1;
+    ATTEMPT_DEVICE_MOVED = 2;
   }
-  optional StatusType        status = 1;
-  optional CalibrationResult result = 2;
+  optional Verdict verdict = 1;
+  optional Attempt attempt = 2;
 }
 ```
 
@@ -707,9 +704,46 @@ message CalibrationStatus {
 | Framing | COBS + 0x00 delimiters | 0xF0/0xF1 + byte stuffing |
 | Integrity | CRC-16/ARC | 16-bit sum |
 | Payload encoding | Protobuf (proto2) | Custom binary (INT24, FLOAT40) |
-| Shot delivery | Push (AlertNotification) | Push (D4/ED/EF burst) |
+| Shot delivery | Push (alert notification) | Push (D4/ED/EF burst) |
 | Handshake | MultiLink + 5024 + 5050 (~1s) | DSP + AVR + PI sync (~1.2s) |
-| State machine | STANDBY → WAITING → RECORDING → PROCESSING | IDLE → ARMED → tracking |
-| Re-arm | Automatic (returns to WAITING) | Manual (0xB0 [01 01] after IDLE) |
+| State machine | idle → armed → capturing → analyzing | IDLE → ARMED → tracking |
+| Re-arm | Automatic (returns to armed) | Manual (0xB0 [01 01] after IDLE) |
 | Encryption | None (bonded devices) | None |
 | Keepalive | BLE supervision timeout (OS) | Status poll every ~1s |
+
+---
+
+## 15. Identity in Raw Captures
+
+Some messages carry the device's identity or keys. A raw capture meant to
+leave the machine (a bug report, a shot export) must not contain them.
+`gfdi::carries_identity` and `capture::IdentityFilter` keep them out.
+
+| Messages | Why they are excluded |
+|---|---|
+| Device Information (5024) | Unit ID, product, Bluetooth friendly and device names |
+| FIT Definition / FIT Data (5011, 5012) | FIT files carry the device serial |
+| File Transfer / File Data (5003, 5004) | File contents, FIT files included |
+| Authentication (5101-5112) | Pairing material and session keys |
+| ACK (5000) of any of the above | Dropped with the exchange it answers; a reply's response payload belongs to that exchange |
+| ACK too short to name the type it acknowledges | Cannot be classified |
+
+`IdentityFilter` works on BLE chunks, not frames, because that is what a
+capture records. Classification is by GFDI message type only; protobuf
+payloads are not inspected.
+
+- Every chunk starts with the MultiLink handle byte; the rest is the
+  `0x00`-delimited COBS stream (Section 3).
+- A chunk that leaves no frame open is released at once. A chunk that leaves a
+  frame open is held until the frame's closing `0x00` arrives.
+- When the frame is complete it is COBS-decoded, CRC-checked and classified.
+  If it is safe, the held chunks are released in order. If it carries
+  identity, every chunk holding any of its bytes is dropped, including the
+  chunk carrying its closing delimiter.
+- A frame that cannot be classified is dropped the same way: bad COBS, under
+  6 bytes, a failed CRC, more than 8 KiB of COBS bytes, or still open after
+  256 chunks have been held for it. Past either bound the filter drops
+  every chunk until the next `0x00`, then starts afresh.
+
+A whole chunk is the unit, so a safe frame sharing a chunk with a dropped one
+loses that chunk. Use one filter per direction.

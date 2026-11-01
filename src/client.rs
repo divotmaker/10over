@@ -21,7 +21,7 @@ use std::time::Instant;
 use crate::error::Error;
 use crate::gfdi::{self, GfdiFrame, StreamBuffer};
 use crate::multilink;
-use crate::proto::{self, DeviceError, DeviceState, ShotData, SmartEvent};
+use crate::proto::{self, DeviceError, DeviceState, EnvelopeEvent, ShotData};
 
 /// How long to remember shot IDs for deduplication (seconds).
 /// R10 replays shots at 6x, and back-to-back shots can overlap.
@@ -80,10 +80,11 @@ pub enum Event {
     DeviceError(DeviceError),
     /// Subscribe response received.
     Subscribed { success: bool },
-    /// WakeUp response received.
-    WakeUpResponse { status: i32 },
-    /// Shot config response received (environment/tee distance).
-    ShotConfigResponse { success: bool },
+    /// Reply to the wake (arm) command. `status` 0 = woken, 1 = already
+    /// active from a previous session, 2 = failed.
+    WakeResult { status: i32 },
+    /// Reply to an environment update sent with [`Client::send_environment`].
+    EnvironmentResult { success: bool },
 }
 
 /// Client state machine phases.
@@ -97,9 +98,9 @@ enum Phase {
     WaitCapabilities,
     /// Waiting for ACK of our 5050 (handshake complete).
     WaitCapabilitiesAck,
-    /// Subscribing to LAUNCH_MONITOR alerts.
+    /// Subscribing to shot-data alerts.
     Subscribing,
-    /// Sending WakeUp request.
+    /// Sending the wake (arm) command.
     WakingUp,
     /// Normal operation — listening for shots.
     Active,
@@ -312,33 +313,33 @@ impl<T: Transport> Client<T> {
 
     fn handle_protobuf(&mut self, payload: &[u8], _msg_type: u16) -> Result<Option<Event>, Error> {
         let (_hdr, pb_data) = gfdi::parse_frag_header(payload)?;
-        let smart_event = proto::decode_smart(pb_data)?;
+        let envelope_event = proto::decode_envelope(pb_data)?;
 
-        match smart_event {
-            SmartEvent::SubscribeResponse { success } => {
+        match envelope_event {
+            EnvelopeEvent::SubscribeResult { success } => {
                 if self.phase == Phase::Subscribing {
                     self.phase = Phase::WakingUp;
                     self.send_wakeup()?;
                 }
                 Ok(Some(Event::Subscribed { success }))
             }
-            SmartEvent::WakeUpResponse { status } => {
+            EnvelopeEvent::WakeResult { status } => {
                 if self.phase == Phase::WakingUp {
                     self.phase = Phase::Active;
                 }
-                // status 1 = ALREADY_AWAKE: device won't send state transitions,
-                // it's already in WAITING from a previous session.
-                // Emit WakeUpResponse now, queue Ready for next poll().
+                // status 1 = already active: the device was armed by a
+                // previous session and will not send an armed-state transition.
+                // Emit WakeResult now, queue Ready for next poll().
                 if status == 1 {
                     self.last_state = Some(DeviceState::Waiting);
                     self.pending_event = Some(Event::Ready);
                 }
-                Ok(Some(Event::WakeUpResponse { status }))
+                Ok(Some(Event::WakeResult { status }))
             }
-            SmartEvent::ShotConfigResponse { success } => {
-                Ok(Some(Event::ShotConfigResponse { success }))
+            EnvelopeEvent::EnvironmentResult { success } => {
+                Ok(Some(Event::EnvironmentResult { success }))
             }
-            SmartEvent::StateChange(state) => {
+            EnvelopeEvent::StateChange(state) => {
                 let changed = self.last_state != Some(state);
                 self.last_state = Some(state);
                 if changed {
@@ -353,7 +354,7 @@ impl<T: Transport> Client<T> {
                 }
                 Ok(None)
             }
-            SmartEvent::Shot(shot) => {
+            EnvelopeEvent::Shot(shot) => {
                 let now = Instant::now();
                 // Prune shots older than the dedup window.
                 self.recent_shots
@@ -365,24 +366,24 @@ impl<T: Transport> Client<T> {
                 self.recent_shots.push((shot.shot_id, now));
                 Ok(Some(Event::Shot(shot)))
             }
-            SmartEvent::Error(err) => Ok(Some(Event::DeviceError(err))),
-            SmartEvent::CalibrationStatus { .. }
-            | SmartEvent::LaunchMonitorResponse
-            | SmartEvent::Unknown => Ok(None),
+            EnvelopeEvent::Error(err) => Ok(Some(Event::DeviceError(err))),
+            EnvelopeEvent::LevelCheck { .. }
+            | EnvelopeEvent::MonitorReply
+            | EnvelopeEvent::Unknown => Ok(None),
         }
     }
 
-    /// Send a `ShotConfig` message (environmental data and/or tee
-    /// distance from the device) to the R10.
+    /// Send an [`Environment`](proto::Environment) message (environmental
+    /// data and/or tee distance from the device) to the R10.
     ///
     /// Safe to call in any phase; the device replies with
-    /// `Event::ShotConfigResponse`.
+    /// `Event::EnvironmentResult`.
     ///
     /// # Errors
     ///
     /// Returns `Err` on transport write failure.
-    pub fn send_shot_config(&mut self, config: &proto::ShotConfig) -> Result<(), Error> {
-        let pb_data = proto::build_shot_config_request(config);
+    pub fn send_environment(&mut self, config: &proto::Environment) -> Result<(), Error> {
+        let pb_data = proto::build_environment_request(config);
         let frame = gfdi::build_protobuf_request(self.next_req_id(), &pb_data);
         self.send_frame(&frame)
     }
@@ -443,10 +444,6 @@ mod tests {
                 reg_tx: Rc::new(RefCell::new(Vec::new())),
             }
         }
-
-        fn push_rx(&self, data: Vec<u8>) {
-            self.rx.borrow_mut().push_back(data);
-        }
     }
 
     impl Transport for MockTransport {
@@ -504,17 +501,17 @@ mod tests {
     }
 
     #[test]
-    fn client_sends_shot_config() {
+    fn client_sends_environment() {
         let transport = MockTransport::new();
         let tx = Rc::clone(&transport.tx);
         let mut client = Client::new(transport, 20);
         client.start().unwrap();
 
-        let config = proto::ShotConfig {
-            tee_range: Some(2.3),
-            ..proto::ShotConfig::default()
+        let config = proto::Environment {
+            tee_distance_yd: Some(2.3),
+            ..proto::Environment::default()
         };
-        client.send_shot_config(&config).unwrap();
+        client.send_environment(&config).unwrap();
 
         let sent = tx.borrow();
         assert!(!sent.is_empty());
@@ -530,19 +527,15 @@ mod tests {
         let parsed = gfdi::parse_frame(&frame).unwrap();
         assert_eq!(parsed.msg_type, gfdi::MSG_PROTOBUF_REQUEST);
         let (_hdr, pb_data) = gfdi::parse_frag_header(&parsed.payload).unwrap();
-        let smart = proto::smart::Smart::decode(pb_data).unwrap();
-        let req = smart
-            .launch_monitor_service
-            .unwrap()
-            .shot_config_request
-            .unwrap();
-        assert_eq!(req.tee_range, Some(2.3));
+        let env = proto::envelope::Envelope::decode(pb_data).unwrap();
+        let req = env.monitor.unwrap().environment.unwrap();
+        assert_eq!(req.tee_distance_yd, Some(2.3));
     }
 
     #[test]
-    fn client_handles_shot_config_response() {
-        use proto::launch_monitor::{Service, ShotConfigResponse};
-        use proto::smart::Smart;
+    fn client_handles_environment_result() {
+        use proto::envelope::Envelope;
+        use proto::monitor::{EnvironmentResult, MonitorChannel};
 
         let transport = MockTransport::new();
         let rx = Rc::clone(&transport.rx);
@@ -557,26 +550,15 @@ mod tests {
         let event = client.poll().unwrap();
         assert!(matches!(event, Some(Event::Registered { handle: 1 })));
 
-        // Build a 5044 ShotConfigResponse frame wrapped in COBS with handle.
-        let lm = Service {
-            status_request: None,
-            status_response: None,
-            wake_up_request: None,
-            wake_up_response: None,
-            tilt_request: None,
-            tilt_response: None,
-            start_tilt_cal_request: None,
-            start_tilt_cal_response: None,
-            reset_tilt_cal_request: None,
-            reset_tilt_cal_response: None,
-            shot_config_request: None,
-            shot_config_response: Some(ShotConfigResponse {
-                success: Some(false),
+        // Build a 5044 environment-result frame wrapped in COBS with handle.
+        let envelope = Envelope {
+            alerts: None,
+            monitor: Some(MonitorChannel {
+                environment_result: Some(EnvironmentResult {
+                    accepted: Some(false),
+                }),
+                ..MonitorChannel::default()
             }),
-        };
-        let smart = Smart {
-            event_sharing: None,
-            launch_monitor_service: Some(lm),
         }
         .encode_to_vec();
 
@@ -584,10 +566,10 @@ mod tests {
         payload.extend_from_slice(&1u16.to_le_bytes()); // req_id
         payload.extend_from_slice(&0u32.to_le_bytes()); // offset
         #[allow(clippy::cast_possible_truncation)]
-        let len = smart.len() as u32;
+        let len = envelope.len() as u32;
         payload.extend_from_slice(&len.to_le_bytes()); // total_len
         payload.extend_from_slice(&len.to_le_bytes()); // chunk_size
-        payload.extend_from_slice(&smart);
+        payload.extend_from_slice(&envelope);
         let frame = gfdi::build_frame(gfdi::MSG_PROTOBUF_RESPONSE, &payload);
 
         let mut wire = vec![0x00];
@@ -600,7 +582,7 @@ mod tests {
         let event = client.poll().unwrap();
         assert!(matches!(
             event,
-            Some(Event::ShotConfigResponse { success: false })
+            Some(Event::EnvironmentResult { success: false })
         ));
     }
 }

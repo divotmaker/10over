@@ -42,9 +42,9 @@ fn main() {
                 Event::HandshakeComplete => {
                     eprintln!("handshake complete");
                 }
-                Event::Subscribed { .. } | Event::WakeUpResponse { .. } => {}
-                Event::ShotConfigResponse { success } => {
-                    eprintln!("shot config response: success={success}");
+                Event::Subscribed { .. } | Event::WakeResult { .. } => {}
+                Event::EnvironmentResult { success } => {
+                    eprintln!("environment result: success={success}");
                 }
                 Event::Ready => {
                     if !ready_printed {

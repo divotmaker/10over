@@ -1,0 +1,55 @@
+// tenover's protobuf schema for the Garmin R10: alert channel.
+//
+// The host subscribes to a topic; the device then pushes a `Notification` for
+// each event on it. The R10 publishes on `TOPIC_SHOT_DATA` (8), and its
+// notifications carry a `MonitorReport` in field 1001.
+//
+// This schema declares only what the R10 shot path uses. Fields it does not
+// declare are skipped when decoding, and topic values other than
+// `TOPIC_SHOT_DATA` decode as plain integers.
+
+syntax = "proto2";
+
+package tenover.r10.alerts;
+
+import "monitor.proto";
+
+// Notification topics. The device defines other topics this crate does not
+// declare.
+enum Topic {
+  TOPIC_SHOT_DATA = 8;
+}
+
+// One alert-channel exchange; exactly one field is set.
+message AlertChannel {
+  optional SubscribeCommand subscribe        = 1;  // host → device
+  optional SubscribeResult  subscribe_result = 2;  // device → host
+  optional Notification     notification     = 3;  // device → host
+}
+
+message TopicSelection {
+  optional Topic topic = 1;
+}
+
+message SubscribeCommand {
+  repeated TopicSelection topics = 1;
+}
+
+message SubscribeResult {
+  message TopicOutcome {
+    enum Outcome {
+      OUTCOME_ACCEPTED = 0;
+      OUTCOME_REJECTED = 1;
+    }
+    required Outcome        outcome = 1;
+    optional TopicSelection topic   = 2;
+  }
+  repeated TopicOutcome outcomes = 1;
+}
+
+message Notification {
+  repeated Topic topics = 1;
+
+  // Launch monitor payload: shot metrics, device status, faults, leveling.
+  optional tenover.r10.monitor.MonitorReport monitor = 1001;
+}

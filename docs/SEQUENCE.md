@@ -23,9 +23,9 @@ the R10 uses one transport for all communication.
 | 2. MultiLink registration | REGISTER on char 2810 | ~50ms |
 | 3. GFDI handshake | 5024, 5050 | ~1s |
 | 4. Protobuf session | Subscribe alerts, wake up | ~100ms |
-| 5. Shot reception | AlertNotification (push) | Continuous |
+| 5. Shot reception | Alert notification (push) | Continuous |
 
-**Key difference from ironsight**: The R10 auto-returns to WAITING after each
+**Key difference from ironsight**: The R10 auto-returns to ARMED after each
 shot. No re-arm sequence is needed. The device pushes shot data as event alerts
 without polling.
 
@@ -139,135 +139,142 @@ Handshake completes when the device ACKs the host's 5050.
 ## 5. Protobuf Session (Phase 4)
 
 After handshake, all application messages use GFDI 5043 (request) / 5044
-(response) with a 14-byte protobuf fragmentation header. Payloads are
-`GDI.Proto.Smart.Smart` protobuf messages.
+(response) with a 14-byte protobuf fragmentation header. Each payload is one
+`Envelope` protobuf message (WIRE.md §8.2).
 
 ```
 Host                                  R10
   |                                   |
   |--- 5043 Subscribe alerts -------->|  (11)
-  |    Smart { [30] = EventSharing {  |
-  |      subscribe_request = {        |
-  |        alerts = [{                |
-  |          type: LAUNCH_MONITOR     |
+  |    Envelope { [30] alerts {       |
+  |      subscribe = {                |
+  |        topics = [{                |
+  |          topic: TOPIC_SHOT_DATA   |
   |        }]                         |
   |      }                            |
   |    }}                             |
-  |<-- 5044 Subscribe response -------|  (12)
+  |<-- 5044 Subscribe result ---------|  (12)
   |                                   |
   |--- 5043 Wake up ----------------->|  (13)
-  |    Smart { [38] = LaunchMonitor { |
-  |      wake_up_request = {}         |
+  |    Envelope { [38] monitor {      |
+  |      wake = {}                    |
   |    }}                             |
-  |<-- 5044 Wake up response ---------|  (14)
-  |    status: SUCCESS|ALREADY_AWAKE  |
+  |<-- 5044 Wake result --------------|  (14)
+  |    outcome: WOKEN|ALREADY_ACTIVE  |
   |                                   |
-  |--- 5043 ShotConfig (optional) --->|  (15)
-  |    Smart { [38] = LaunchMonitor { |
-  |      shot_config_request = {      |
-  |        temperature, humidity,     |
-  |        altitude, air_density,     |
-  |        tee_range                  |
+  |--- 5043 Environment (optional) -->|  (15)
+  |    Envelope { [38] monitor {      |
+  |      environment = {              |
+  |        air_temperature_c,         |
+  |        relative_humidity,         |
+  |        elevation_m,               |
+  |        air_density_kg_m3,         |
+  |        tee_distance_yd            |
   |      }                            |
   |    }}                             |
-  |<-- 5044 ShotConfigResponse -------|  (16)
+  |<-- 5044 Environment result -------|  (16)
 ```
 
 ### 5.1 Alert Subscription (Steps 11-12)
 
-Subscribe to `LAUNCH_MONITOR` alerts (AlertType 8) via EventSharing extension
-(field 30). The device will push shot data and state changes as
-`AlertNotification` messages.
+Subscribe to `TOPIC_SHOT_DATA` (topic 8) on the alert channel (envelope
+field 30). The device will push shot data and state changes as alert-channel
+`Notification` messages.
 
 ### 5.2 Wake Up (Steps 13-14)
 
-Send `WakeUpRequest` via LaunchMonitor extension (field 38). Device responds
-with SUCCESS (0) or ALREADY_AWAKE (1). After wake-up, the device enters the
-WAITING state and begins monitoring for shots.
+Send `WakeCommand` on the launch monitor channel (envelope field 38). The
+device responds with a `WakeResult`: `OUTCOME_WOKEN` (0) or
+`OUTCOME_ALREADY_ACTIVE` (1). After wake-up, the device enters the ARMED
+state and begins monitoring for shots.
 
-ALREADY_AWAKE (status 1) occurs when the device was armed from a prior
-session and never went to sleep. The device won't send a WAITING state
+`OUTCOME_ALREADY_ACTIVE` (1) occurs when the device was armed from a prior
+session and never went to sleep. The device won't send an ARMED state
 transition in this case — it's already there.
 
-### 5.3 Shot Configuration (Steps 15-16, optional)
+### 5.3 Environment Settings (Steps 15-16, optional)
 
-Send environmental data: temperature (°C), humidity (0.0-1.0), altitude (m),
-air density (kg/m³), tee range (yards). Not required for shot detection —
+Send `EnvironmentSettings`: air temperature (°C), relative humidity
+(0.0-1.0), elevation (m), air density (kg/m³), tee distance (yards). Not required for shot detection —
 provides context for the device's internal flight model.
 
 ---
 
 ## 6. Shot Data Flow (Phase 5)
 
-The device pushes state changes and shot data via `AlertNotification`
-(GFDI 5043, EventSharing extension field 30, AlertDetails extension field 1001).
+The device pushes state changes and shot data as alert-channel
+`Notification` messages (GFDI 5043, envelope field 30), each carrying a
+`MonitorReport` in field 1001.
 
 ```
 Host                                  R10
   |                                   |
-  |<-- AlertNotification -------------|   state: WAITING
+  |<-- Notification ------------------|   phase: ARMED
   |    (device armed, ready)          |
   |                                   |
   |         ... user swings ...       |
   |                                   |
-  |<-- AlertNotification -------------|   state: RECORDING
-  |<-- AlertNotification -------------|   state: PROCESSING
+  |<-- Notification ------------------|   phase: CAPTURING
+  |<-- Notification ------------------|   phase: ANALYZING
   |                                   |
-  |<-- AlertNotification -------------|   ★ SHOT DATA
-  |    alert_type: [LAUNCH_MONITOR]   |
-  |    [1001] = AlertDetails {        |
-  |      metrics: {                   |
-  |        shot_id: N,                |
-  |        shot_type: NORMAL,         |
-  |        ball_metrics: {            |
-  |          launch_angle,            |
-  |          launch_direction,        |
-  |          ball_speed,              |
-  |          spin_axis,               |
-  |          total_spin,              |
-  |          spin_calculation_type    |
+  |<-- Notification ------------------|   ★ SHOT DATA
+  |    topics: [TOPIC_SHOT_DATA]      |
+  |    [1001] monitor = {             |
+  |      shot: {                      |
+  |        shot_number: N,            |
+  |        kind: KIND_REGULAR,        |
+  |        ball: {                    |
+  |          vertical_angle_deg,      |
+  |          horizontal_angle_deg,    |
+  |          speed_mps,               |
+  |          spin_tilt_deg,           |
+  |          spin_rpm,                |
+  |          spin_source              |
   |        },                         |
-  |        club_metrics: {            |
-  |          club_head_speed,         |
-  |          club_angle_face,         |
-  |          club_angle_path,         |
-  |          attack_angle             |
+  |        club: {                    |
+  |          head_speed_mps,          |
+  |          face_deg,                |
+  |          path_deg,                |
+  |          attack_deg               |
   |        },                         |
-  |        swing_metrics: {           |
-  |          back_swing_start_time,   |
-  |          down_swing_start_time,   |
-  |          impact_time,             |
-  |          follow_through_end_time  |
+  |        timing: {                  |
+  |          takeaway,                |
+  |          transition,              |
+  |          impact,                  |
+  |          finish                   |
   |        }                          |
   |      }                            |
   |    }                              |
   |                                   |
-  |<-- AlertNotification -------------|   state: WAITING
-  |    (device returns to WAITING)    |
+  |<-- Notification ------------------|   phase: ARMED
+  |    (device returns to ARMED)      |
   |    (repeat on next shot)          |
 ```
 
 ### 6.1 State Machine
 
 ```
-STANDBY → INTERFERENCE_TEST → WAITING → RECORDING → PROCESSING → WAITING (loop)
-                                                         ↓
-                                                       ERROR
+IDLE → NOISE_CHECK → ARMED → CAPTURING → ANALYZING → ARMED (loop)
+                                             ↓
+                                          FAULTED
 ```
 
 | State | Duration | Description |
 |---|---|---|
-| STANDBY | Until wake-up | Device powered on, not monitoring |
-| INTERFERENCE_TEST | ~1-2s | Radar self-test on first arm |
-| WAITING | Indefinite | Armed, waiting for ball/club motion |
-| RECORDING | ~1-2s | Radar capturing shot data |
-| PROCESSING | ~1-2s | Computing ball/club metrics |
-| ERROR | Until resolved | Hardware/environmental error |
+| IDLE (0) | Until wake-up | Device powered on, not monitoring |
+| NOISE_CHECK (1) | ~1-2s | Radar self-test on first arm |
+| ARMED (2) | Indefinite | Waiting for ball/club motion |
+| CAPTURING (3) | ~1-2s | Radar capturing shot data |
+| ANALYZING (4) | ~1-2s | Computing ball/club metrics |
+| FAULTED (5) | Until resolved | Hardware/environmental error |
+
+Names are the `DeviceStatus.Phase` values (WIRE.md §10) without the `PHASE_`
+prefix.
 
 ### 6.2 Shot Delivery
 
-Shot data arrives in a dedicated `AlertNotification` containing `metrics`.
-A separate `AlertNotification` with `state: WAITING` follows as the device
+Shot data arrives in a dedicated `Notification` whose report carries `shot`.
+A separate `Notification` with `phase: ARMED` follows as the device
 re-arms. Total protobuf size per shot is ~60-80 bytes — always a single
 GFDI frame.
 
@@ -275,7 +282,7 @@ GFDI frame.
 
 The R10 retransmits unACK'd alerts. If the host's ACK is delayed (e.g. due
 to slow processing), the same shot may arrive multiple times.
-**Deduplicate by `shot_id`.**
+**Deduplicate by `shot_number`.**
 
 State changes should also be deduplicated — only act on transitions, not
 repeated notifications of the same state.
@@ -283,8 +290,8 @@ repeated notifications of the same state.
 ### 6.4 No Re-Arm Required
 
 Unlike the Mevo+ (which requires a manual re-arm sequence after each shot),
-the R10 automatically returns to WAITING after processing. The client simply
-waits for the next `AlertNotification`.
+the R10 automatically returns to ARMED after analyzing. The client simply
+waits for the next `Notification`.
 
 ---
 
@@ -292,13 +299,13 @@ waits for the next `AlertNotification`.
 
 ### 7.1 Device Errors
 
-Error events arrive as `AlertDetails` with an `error` field:
+Error events arrive as a `MonitorReport` with a `fault` field:
 
-| ErrorCode | Description | Typical recovery |
+| Cause | Description | Typical recovery |
 |---|---|---|
-| OVERHEATING | Device temperature too high | Wait for cooldown |
-| RADAR_SATURATION | Interference or reflective surface | Move device, clear area |
-| PLATFORM_TILTED | Device not level | Re-level, recalibrate tilt |
+| CAUSE_TOO_HOT | Device temperature too high | Wait for cooldown |
+| CAUSE_SIGNAL_OVERLOAD | Interference or reflective surface | Move device, clear area |
+| CAUSE_NOT_LEVEL | Device not level | Re-level, recalibrate tilt |
 
 ### 7.2 GFDI Errors
 
@@ -327,9 +334,9 @@ For a working R10 client, the minimum required steps:
 | 5 | GFDI | Receive 5024, respond with ACK + host info |
 | 6 | GFDI | ACK 5011/5012 if received (no parsing) |
 | 7 | GFDI | Receive 5050, ACK, send host 5050 (with bit 30 set) |
-| 8 | Protobuf | Subscribe to LAUNCH_MONITOR alerts |
-| 9 | Protobuf | Send WakeUpRequest |
-| 10 | Protobuf | Receive AlertNotification with Metrics → extract shot |
+| 8 | Protobuf | Subscribe to `TOPIC_SHOT_DATA` alerts |
+| 9 | Protobuf | Send `WakeCommand` |
+| 10 | Protobuf | Receive `Notification` with `ShotReadout` → extract shot |
 
 Steps 1-7 are the connection + handshake (~1s after BLE connect). Steps 8-9
 are one-time session setup. Step 10 repeats for each shot.
@@ -339,7 +346,7 @@ are one-time session setup. Step 10 repeats for each shot.
 | Feature | Status | Notes |
 |---|---|---|
 | FIT parsing (5011/5012) | Skip | ACK with `[0x00]`, no parsing needed |
-| ShotConfigRequest | Skip | Not required for shot detection |
+| `EnvironmentSettings` | Skip | Not required for shot detection |
 | Tilt calibration | Skip | Enhances accuracy but not required |
 | Status polling | Skip | Shot data pushed automatically |
 | XTEA authentication | Skip | Not used for bonded devices |

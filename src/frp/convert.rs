@@ -61,7 +61,7 @@ mod tests {
             total_spin,
             backspin: total_spin * axis_rad.cos(),
             sidespin: total_spin * axis_rad.sin(),
-            spin_calc_type: SpinCalcType::Ratio,
+            spin_calc_type: SpinCalcType::Estimated,
         }
     }
 

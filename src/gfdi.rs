@@ -5,31 +5,116 @@
 //!
 //! Wire format: `[0x00] [COBS(frame)] [0x00]`
 //! Frame: `[length: u16 LE] [header: 2-4 bytes] [payload] [crc: u16 LE]`
+//!
+//! The public surface is message classification: the `MSG_*` message types,
+//! [`parse_cobs_frame`] and [`carries_identity`]. Callers that record or
+//! forward raw traffic use them (or [`crate::capture::IdentityFilter`],
+//! which is built on them) to keep the device's identity and keys out of
+//! anything they export.
+
+use std::ops::RangeInclusive;
 
 use crate::cobs;
 use crate::crc::crc16;
 use crate::error::Error;
 
 // ── Message types ──
+//
+// Message types are plain `u16` constants rather than an enum: the type
+// field is an open 16-bit space, so a frame of a type this crate has no name
+// for still parses and round-trips unchanged through `GfdiFrame::msg_type`,
+// and naming another type later is an additive change.
 
-pub(crate) const MSG_ACK: u16 = 5000;
-pub(crate) const MSG_DEVICE_INFO: u16 = 5024;
-pub(crate) const MSG_FIT_DEFINITION: u16 = 5011;
-pub(crate) const MSG_FIT_DATA: u16 = 5012;
-pub(crate) const MSG_CONFIGURATION: u16 = 5050;
-pub(crate) const MSG_PROTOBUF_REQUEST: u16 = 5043;
-pub(crate) const MSG_PROTOBUF_RESPONSE: u16 = 5044;
+/// Acknowledgment. Its payload starts with the type it acknowledges (u16 LE)
+/// and a status byte.
+pub const MSG_ACK: u16 = 5000;
+/// File transfer request.
+pub const MSG_FILE_TRANSFER: u16 = 5003;
+/// File transfer data.
+pub const MSG_FILE_DATA: u16 = 5004;
+/// FIT definition message.
+pub const MSG_FIT_DEFINITION: u16 = 5011;
+/// FIT data message.
+pub const MSG_FIT_DATA: u16 = 5012;
+/// Device information: unit ID, product, software version and the device's
+/// Bluetooth names. The device sends it first in the handshake.
+pub const MSG_DEVICE_INFO: u16 = 5024;
+/// Protobuf request.
+pub const MSG_PROTOBUF_REQUEST: u16 = 5043;
+/// Protobuf response.
+pub const MSG_PROTOBUF_RESPONSE: u16 = 5044;
+/// Configuration: the capability bitmap exchange.
+pub const MSG_CONFIGURATION: u16 = 5050;
+/// Authentication and session-key messages.
+pub const MSG_AUTH: RangeInclusive<u16> = 5101..=5112;
 
 /// Capability bit for R10 launch monitor (SwingSensor).
 pub(crate) const CAP_SWING_SENSOR: usize = 30;
 
+/// Whether messages of type `msg_type` carry the device's identity or keys:
+/// device information (unit ID, Bluetooth names), FIT and file transfer
+/// (FIT files carry the device serial) and authentication (keys).
+///
+/// This classifies the type alone, never the payload (protobuf payloads are
+/// not inspected). An ACK of one of these types repeats part of it;
+/// [`GfdiFrame::carries_identity`] covers that case too.
+#[must_use]
+pub fn carries_identity(msg_type: u16) -> bool {
+    matches!(
+        msg_type,
+        MSG_FILE_TRANSFER | MSG_FILE_DATA | MSG_FIT_DEFINITION | MSG_FIT_DATA | MSG_DEVICE_INFO
+    ) || MSG_AUTH.contains(&msg_type)
+}
+
 /// Parsed GFDI frame.
-#[derive(Debug, Clone)]
-pub(crate) struct GfdiFrame {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GfdiFrame {
     pub(crate) msg_type: u16,
-    #[allow(dead_code)]
     pub(crate) txn_id: Option<u8>,
     pub(crate) payload: Vec<u8>,
+}
+
+impl GfdiFrame {
+    /// Message type, with the compressed header form already expanded.
+    #[must_use]
+    pub fn msg_type(&self) -> u16 {
+        self.msg_type
+    }
+
+    /// Transaction ID, present when the frame used the compressed header.
+    #[must_use]
+    pub fn txn_id(&self) -> Option<u8> {
+        self.txn_id
+    }
+
+    /// Payload: the bytes between the header and the CRC.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// For an ACK, the message type it acknowledges. `None` for other
+    /// messages and for an ACK too short to name one.
+    #[must_use]
+    pub fn acked_type(&self) -> Option<u16> {
+        if self.msg_type != MSG_ACK {
+            return None;
+        }
+        self.payload
+            .get(..2)
+            .map(|t| u16::from_le_bytes([t[0], t[1]]))
+    }
+
+    /// Whether this frame carries the device's identity or keys: its type
+    /// does (see [`carries_identity`]), or it is an ACK of such a type, or
+    /// it is an ACK too short to say what it acknowledges.
+    #[must_use]
+    pub fn carries_identity(&self) -> bool {
+        if self.msg_type == MSG_ACK {
+            return self.acked_type().is_none_or(carries_identity);
+        }
+        carries_identity(self.msg_type)
+    }
 }
 
 /// Device information from the 5024 handshake message.
@@ -103,15 +188,22 @@ impl StreamBuffer {
             let cobs_owned = cobs_data.to_vec();
             self.buf.drain(..consumed);
 
-            return Some(match cobs::decode(&cobs_owned) {
-                Ok(decoded) => parse_frame(&decoded),
-                Err(e) => Err(Error::Cobs(e)),
-            });
+            return Some(parse_cobs_frame(&cobs_owned));
         }
     }
 }
 
 // ── Frame parsing ──
+
+/// Parse one COBS-encoded GFDI frame, `0x00` delimiters already stripped.
+///
+/// # Errors
+///
+/// Returns `Err` if the bytes are not valid COBS, the decoded frame is
+/// shorter than 6 bytes, or its CRC does not match.
+pub fn parse_cobs_frame(cobs_bytes: &[u8]) -> Result<GfdiFrame, Error> {
+    parse_frame(&cobs::decode(cobs_bytes)?)
+}
 
 /// Parse a decoded (post-COBS) GFDI frame.
 ///
@@ -434,7 +526,7 @@ mod tests {
         let cobs_frame = wrap_cobs(&frame);
 
         let mut buf = StreamBuffer::new();
-        buf.extend(&cobs_frame);
+        buf.extend(&cobs_frame).unwrap();
         let f = buf.next_frame().unwrap().unwrap();
         assert_eq!(f.msg_type, 5024);
         assert_eq!(f.payload, b"test");
@@ -449,9 +541,9 @@ mod tests {
         let mut buf = StreamBuffer::new();
         // Feed in two halves
         let mid = cobs_frame.len() / 2;
-        buf.extend(&cobs_frame[..mid]);
+        buf.extend(&cobs_frame[..mid]).unwrap();
         assert!(buf.next_frame().is_none()); // incomplete
-        buf.extend(&cobs_frame[mid..]);
+        buf.extend(&cobs_frame[mid..]).unwrap();
         let f = buf.next_frame().unwrap().unwrap();
         assert_eq!(f.msg_type, 5050);
     }
@@ -462,18 +554,18 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(&150u16.to_le_bytes()); // protocol_version
         payload.extend_from_slice(&3622u16.to_le_bytes()); // product_number (0x0E26)
-        payload.extend_from_slice(&0x12345678u32.to_le_bytes()); // unit_id
+        payload.extend_from_slice(&0x1234_5678u32.to_le_bytes()); // unit_id
         payload.extend_from_slice(&430u16.to_le_bytes()); // software_version (4.30)
         payload.extend_from_slice(&0x021Bu16.to_le_bytes()); // max_packet_size
 
         // friendly_name: "Approach R10"
         let name = b"Approach R10";
-        payload.push(name.len() as u8);
+        payload.push(u8::try_from(name.len()).unwrap());
         payload.extend_from_slice(name);
 
         // device_name: "ApproachR10"
         let dev = b"ApproachR10";
-        payload.push(dev.len() as u8);
+        payload.push(u8::try_from(dev.len()).unwrap());
         payload.extend_from_slice(dev);
 
         // model_name: empty
@@ -506,9 +598,61 @@ mod tests {
         let (hdr, data) = parse_frag_header(&parsed.payload).unwrap();
         assert_eq!(hdr.req_id, 42);
         assert_eq!(hdr.offset, 0);
-        assert_eq!(hdr.total_len, pb_data.len() as u32);
-        assert_eq!(hdr.chunk_size, pb_data.len() as u32);
+        let len = u32::try_from(pb_data.len()).unwrap();
+        assert_eq!(hdr.total_len, len);
+        assert_eq!(hdr.chunk_size, len);
         assert_eq!(data, pb_data);
+    }
+
+    #[test]
+    fn identity_types_are_excluded() {
+        for t in [5003, 5004, 5011, 5012, 5024, 5101, 5112] {
+            assert!(carries_identity(t), "{t}");
+        }
+        for t in [5000, 5043, 5044, 5050, 5100, 5113] {
+            assert!(!carries_identity(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn acks_carry_identity_of_what_they_acknowledge() {
+        let frame = |acked: u16| parse_frame(&build_ack(acked, 0, &[0xAA])).unwrap();
+        assert!(frame(MSG_DEVICE_INFO).carries_identity());
+        assert!(frame(5101).carries_identity());
+        assert!(!frame(MSG_PROTOBUF_RESPONSE).carries_identity());
+        assert_eq!(
+            frame(MSG_CONFIGURATION).acked_type(),
+            Some(MSG_CONFIGURATION)
+        );
+        // An ACK too short to name a type cannot be cleared.
+        let bare_ack = parse_frame(&build_frame(MSG_ACK, &[0x2C])).unwrap();
+        assert_eq!(bare_ack.acked_type(), None);
+        assert!(bare_ack.carries_identity());
+        // A non-ACK names no acknowledged type.
+        let shot = parse_frame(&build_frame(MSG_PROTOBUF_RESPONSE, b"shot")).unwrap();
+        assert_eq!(shot.acked_type(), None);
+        assert!(!shot.carries_identity());
+    }
+
+    #[test]
+    fn parse_cobs_frame_strips_cobs_and_checks_crc() {
+        let wire = wrap_cobs(&build_frame(MSG_PROTOBUF_REQUEST, b"a\x00b"));
+        let f = parse_cobs_frame(&wire[1..wire.len() - 1]).unwrap();
+        assert_eq!(f.msg_type(), MSG_PROTOBUF_REQUEST);
+        assert_eq!(f.payload(), b"a\x00b");
+        assert_eq!(f.txn_id(), None);
+        assert!(matches!(
+            parse_cobs_frame(&[0x09, 0x41]),
+            Err(Error::Cobs(_))
+        ));
+        assert!(matches!(
+            parse_cobs_frame(&[0x03, 0x41, 0x42]),
+            Err(Error::FrameTooShort { .. })
+        ));
+        let mut bad = wire[1..wire.len() - 1].to_vec();
+        let n = bad.len();
+        bad[n - 1] ^= 0x01;
+        assert!(matches!(parse_cobs_frame(&bad), Err(Error::Crc { .. })));
     }
 
     #[test]
@@ -517,7 +661,7 @@ mod tests {
         // [length u16] [msg_type-5000 u8] [txn_id|0x80 u8] [payload] [crc u16]
         let mut frame = Vec::new();
         let payload = b"test";
-        let length = (2 + 1 + 1 + payload.len() + 2) as u16;
+        let length = u16::try_from(2 + 1 + 1 + payload.len() + 2).unwrap();
         frame.extend_from_slice(&length.to_le_bytes());
         frame.push(43); // 5043 - 5000
         frame.push(0x81); // txn_id=1 | 0x80

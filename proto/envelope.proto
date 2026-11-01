@@ -1,0 +1,21 @@
+// tenover's protobuf schema for the Garmin R10: top-level envelope.
+//
+// Every protobuf payload in a GFDI 5043 (request) or 5044 (response) message,
+// after the 14-byte fragment header, is one `Envelope`. It carries one channel:
+// field 30 for alerts (subscriptions and pushed notifications) or field 38 for
+// launch monitor commands and replies. Fields this schema does not declare are
+// skipped when decoding.
+
+syntax = "proto2";
+
+package tenover.r10.envelope;
+
+import "alerts.proto";
+import "monitor.proto";
+
+message Envelope {
+  // Alert subscriptions and notifications (shot data arrives here).
+  optional tenover.r10.alerts.AlertChannel alerts = 30;
+  // Launch monitor commands and their replies.
+  optional tenover.r10.monitor.MonitorChannel monitor = 38;
+}

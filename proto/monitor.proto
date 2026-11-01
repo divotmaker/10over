@@ -1,0 +1,208 @@
+// tenover's protobuf schema for the Garmin R10: launch monitor channel.
+//
+// Commands and replies travel in `MonitorChannel` (envelope field 38).
+// Unsolicited reports (shots, status changes, faults, leveling) arrive as a
+// `MonitorReport` inside an alert-channel `Notification` (field 1001).
+
+syntax = "proto2";
+
+package tenover.r10.monitor;
+
+// One launch-monitor exchange; exactly one field is set.
+message MonitorChannel {
+  optional StateQuery            state_query            = 1;   // host → device
+  optional StateReply            state_reply            = 2;   // device → host
+  optional WakeCommand           wake                   = 3;   // host → device
+  optional WakeResult            wake_result            = 4;   // device → host
+  optional LevelQuery            level_query            = 5;   // host → device
+  optional LevelReply            level_reply            = 6;   // device → host
+  optional LevelCalibrateCommand level_calibrate        = 7;   // host → device
+  optional LevelCalibrateResult  level_calibrate_result = 8;   // device → host
+  optional LevelClearCommand     level_clear            = 9;   // host → device
+  optional LevelClearResult      level_clear_result     = 10;  // device → host
+  optional EnvironmentSettings   environment            = 11;  // host → device
+  optional EnvironmentResult     environment_result     = 12;  // device → host
+}
+
+// --- Device status ---
+
+message StateQuery {
+}
+
+message StateReply {
+  optional DeviceStatus status = 1;
+}
+
+// --- Wake (arm) ---
+
+message WakeCommand {
+}
+
+message WakeResult {
+  enum Outcome {
+    OUTCOME_WOKEN          = 0;
+    OUTCOME_ALREADY_ACTIVE = 1;
+    OUTCOME_FAILED         = 2;
+  }
+  optional Outcome outcome = 1;
+}
+
+// --- Leveling ---
+
+message LevelQuery {
+}
+
+message LevelReply {
+  optional Orientation orientation = 1;
+}
+
+message Orientation {
+  optional float roll_deg  = 1;
+  optional float pitch_deg = 2;
+}
+
+message LevelCalibrateCommand {
+}
+
+message LevelCalibrateResult {
+  enum Progress {
+    PROGRESS_BEGUN   = 0;
+    PROGRESS_RUNNING = 1;
+    PROGRESS_FAILED  = 2;
+  }
+  optional Progress progress = 1;
+}
+
+message LevelClearCommand {
+  optional bool confirm = 1;
+}
+
+message LevelClearResult {
+  enum Outcome {
+    OUTCOME_CLEARABLE     = 1;
+    OUTCOME_ALREADY_CLEAR = 2;
+    OUTCOME_CLEARED       = 3;
+    OUTCOME_NOT_CLEARABLE = 4;
+  }
+  optional Outcome outcome = 1;
+}
+
+// --- Environment (inputs to the device's flight model) ---
+
+message EnvironmentSettings {
+  optional float air_temperature_c = 1;  // °C
+  optional float relative_humidity = 2;  // 0.0–1.0 (fraction, not percent)
+  optional float elevation_m       = 3;  // meters
+  optional float air_density_kg_m3 = 4;  // kg/m³
+  optional float tee_distance_yd   = 5;  // yards from device to tee
+}
+
+message EnvironmentResult {
+  optional bool accepted = 1;
+}
+
+// --- Reports (pushed in alert notifications) ---
+
+message MonitorReport {
+  optional DeviceStatus status = 1;
+  optional ShotReadout  shot   = 2;
+  optional Fault        fault  = 3;
+  optional LevelCheck   level  = 4;
+}
+
+message DeviceStatus {
+  enum Phase {
+    PHASE_IDLE        = 0;
+    PHASE_NOISE_CHECK = 1;
+    PHASE_ARMED       = 2;  // waiting for a shot
+    PHASE_CAPTURING   = 3;  // recording a shot
+    PHASE_ANALYZING   = 4;  // computing metrics
+    PHASE_FAULTED     = 5;
+  }
+  optional Phase phase = 1;
+}
+
+message LevelCheck {
+  enum Verdict {
+    VERDICT_LEVEL           = 1;
+    VERDICT_RELEVEL_ADVISED = 2;
+    VERDICT_RELEVEL_NEEDED  = 3;
+  }
+  enum Attempt {
+    ATTEMPT_OK           = 0;
+    ATTEMPT_FAILED       = 1;
+    ATTEMPT_DEVICE_MOVED = 2;
+  }
+  optional Verdict verdict = 1;
+  optional Attempt attempt = 2;
+}
+
+// --- Shot ---
+
+message ShotReadout {
+  enum Kind {
+    KIND_WARMUP  = 0;
+    KIND_REGULAR = 1;
+  }
+  optional uint32       shot_number = 1;
+  optional Kind         kind        = 2;
+  optional BallLaunch   ball        = 3;
+  optional ClubDelivery club        = 4;
+  optional SwingTiming  timing      = 5;
+}
+
+message BallLaunch {
+  enum SpinSource {
+    SPIN_SOURCE_ESTIMATED    = 0;
+    SPIN_SOURCE_FLIGHT_MODEL = 1;
+    SPIN_SOURCE_UNCLASSIFIED = 2;
+    SPIN_SOURCE_DIRECT       = 3;  // read off a marked ball
+  }
+  enum Marking {
+    MARKING_UNSPECIFIED = 0;
+    MARKING_PLAIN       = 1;  // unmarked ball
+    MARKING_DOTTED      = 2;  // marked ball (enables measured spin)
+  }
+  optional float      vertical_angle_deg   = 1;
+  optional float      horizontal_angle_deg = 2;
+  optional float      speed_mps            = 3;
+  optional float      spin_tilt_deg        = 4;
+  optional float      spin_rpm             = 5;
+  optional SpinSource spin_source          = 6;
+  optional Marking    marking              = 7;
+}
+
+message ClubDelivery {
+  optional float head_speed_mps = 1;
+  optional float face_deg       = 2;
+  optional float path_deg       = 3;
+  optional float attack_deg     = 4;
+}
+
+// Swing phase timestamps, all in ms of device time.
+message SwingTiming {
+  optional uint32 takeaway    = 1;
+  optional uint32 transition  = 2;
+  optional uint32 impact      = 3;
+  optional uint32 finish      = 4;
+  optional uint32 capture_end = 5;
+}
+
+// --- Fault ---
+
+message Fault {
+  enum Cause {
+    CAUSE_UNSPECIFIED     = 0;
+    CAUSE_TOO_HOT         = 1;
+    CAUSE_SIGNAL_OVERLOAD = 2;
+    CAUSE_NOT_LEVEL       = 3;
+  }
+  enum Urgency {
+    URGENCY_LOW      = 0;
+    URGENCY_HIGH     = 1;
+    URGENCY_CRITICAL = 2;
+  }
+  optional Cause       cause       = 1;
+  optional Urgency     urgency     = 2;
+  optional Orientation orientation = 3;
+}

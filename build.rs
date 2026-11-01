@@ -3,9 +3,9 @@ use std::io::Result;
 fn main() -> Result<()> {
     prost_build::Config::new().btree_map(["."]).compile_protos(
         &[
-            "proto/GDISmart.proto",
-            "proto/GDIEventSharing.proto",
-            "proto/GDILaunchMonitor.proto",
+            "proto/envelope.proto",
+            "proto/alerts.proto",
+            "proto/monitor.proto",
         ],
         &["proto/"],
     )?;
