@@ -21,7 +21,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Clippy
-        run: cargo clippy --all-targets --features frp
+        run: cargo clippy --all-targets --features frp -- -D warnings
 
       - name: Run tests
         run: cargo test --lib --features frp
