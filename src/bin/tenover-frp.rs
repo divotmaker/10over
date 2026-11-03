@@ -108,9 +108,11 @@ fn main() -> ExitCode {
                 }
 
                 // Check for controller commands
-                if let Some(mode) = frp.check_controller() {
+                if let Some(cmd) = frp.check_controller() {
                     eprintln!(
-                        "tenover-frp: mode request: {mode:?} (R10 does not support mode switching)"
+                        "tenover-frp: controller command: mode {:?}, hand {:?}, club {:?} \
+                         (R10 does not support mode, hand or club switching)",
+                        cmd.mode, cmd.handed, cmd.club
                     );
                 }
             }

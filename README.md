@@ -190,6 +190,11 @@ standard [FlightRelay](https://github.com/flightrelay/spec) device. Any FRP
 controller (flighthook, dashboards, etc.) can connect over WebSocket and receive
 shot data without knowing anything about the R10 protocol.
 
+`FrpDevice::check_controller()` returns the controller's `set_detection_mode`
+request as a `ControllerCommand` (`mode`, `handed`, `club`, each `None` when
+absent or unrecognized). The R10 has no mode, hand or club switching, so the
+request is informational.
+
 A standalone binary is included:
 
 ```sh
