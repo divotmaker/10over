@@ -358,7 +358,7 @@ mod tests {
         assert!(f.feed(&[HANDLE, 0x00, 0x02, 0x41, 0x00], 1).is_empty());
         // Truncated COBS.
         assert!(f.feed(&[HANDLE, 0x00, 0x09, 0x41, 0x00], 2).is_empty());
-        // The filter still releases a good frame afterwards.
+        // The filter still releases a good frame afterward.
         let ok = testing::with_handle(HANDLE, &testing::encode_frame(MSG_PROTOBUF_RESPONSE, b"x"));
         assert_eq!(f.feed(&ok, 3), [3]);
     }

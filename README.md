@@ -95,7 +95,7 @@ bump the minor version.
 
 ## Migrating from 0.2
 
-0.3.0 renames public items so the API says what the R10 does. Behaviour and
+0.3.0 renames public items so the API says what the R10 does. Behavior and
 wire bytes are unchanged; only names moved.
 
 | 0.2 | 0.3 |
