@@ -2,7 +2,8 @@
 //!
 //! Runs a tokio runtime in a background thread. Notifications are forwarded
 //! via `std::sync::mpsc`; writes are sent to the background thread via
-//! `tokio::sync::mpsc` and executed as `peripheral.write()`.
+//! `tokio::sync::mpsc` and executed as `peripheral.write()`. Dropping the
+//! transport disconnects the peripheral and ends the thread.
 //!
 //! The device must be pre-paired at the OS level — btleplug has no pairing API.
 //!
@@ -24,9 +25,12 @@
 //! }
 //! ```
 
+use std::future::Future;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::thread;
+use std::time::Duration;
 
 use btleplug::api::{
     Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType,
@@ -36,6 +40,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
+use crate::ble::Worker;
 use crate::client::Transport;
 
 /// Full UUID for characteristic 6A4E2810 (bidirectional: register + notifications).
@@ -48,9 +53,16 @@ const R10_DEVICE_NAME: &str = "Approach R10";
 const GARMIN_MANUFACTURER_ID: u16 = 0x0087;
 
 /// Discovery timeout.
-const SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time to wait for GATT service discovery after connection.
-const SERVICE_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SERVICE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often a cancelable wait looks at the cancel flag.
+const CANCEL_POLL: Duration = Duration::from_millis(100);
+/// Longest wait for a disconnect.
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Longest wait for the background thread to disconnect and finish: a
+/// write in flight, then the disconnect.
+const STOP_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Write channel capacity — small buffer, writes are fast.
 const WRITE_CHANNEL_CAP: usize = 32;
@@ -81,6 +93,10 @@ pub enum BtleplugError {
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+
+    /// The caller's cancel flag was set.
+    #[error("canceled")]
+    Canceled,
 }
 
 /// A write command sent to the background thread.
@@ -103,8 +119,8 @@ pub struct BtleplugTransport {
     write_tx: tokio_mpsc::Sender<WriteCmd>,
     /// BLE address of the connected device.
     device_address: String,
-    /// Keep the background thread alive.
-    _bg_thread: thread::JoinHandle<()>,
+    /// The background thread; stopping it disconnects the peripheral.
+    worker: Worker,
 }
 
 impl BtleplugTransport {
@@ -118,10 +134,30 @@ impl BtleplugTransport {
     /// Returns [`BtleplugError`] if no R10 is found, connection fails, or
     /// characteristic discovery fails.
     pub fn auto_connect() -> Result<Self, BtleplugError> {
+        Self::auto_connect_with(&AtomicBool::new(false), &mut |_| {})
+    }
+
+    /// [`auto_connect`](Self::auto_connect) that a caller can cut short.
+    ///
+    /// Setting `cancel` (from another thread) ends the attempt with
+    /// [`BtleplugError::Canceled`]: every step (the 10 s scan, the connect,
+    /// service discovery, the subscription) is raced against the flag, which
+    /// is checked every 100 ms, and a peripheral this call connected is
+    /// disconnected again. `log` receives progress lines, including the
+    /// peripherals the scan found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BtleplugError`] if no R10 is found, connection fails,
+    /// characteristic discovery fails, or `cancel` was set.
+    pub fn auto_connect_with(
+        cancel: &AtomicBool,
+        log: &mut dyn FnMut(&str),
+    ) -> Result<Self, BtleplugError> {
         // Build a temporary runtime for the connection setup (blocking).
         let rt = Runtime::new().map_err(|e| BtleplugError::Runtime(e.to_string()))?;
-        let (peripheral, address) = rt.block_on(discover_and_connect())?;
-        Self::start_background(peripheral, address, rt)
+        let (peripheral, address) = rt.block_on(discover_and_connect(cancel, log))?;
+        Self::start_background(peripheral, address, rt, cancel)
     }
 
     /// Connect to a known device by BLE address string (e.g. `F5:D1:88:F6:90:5D`).
@@ -134,7 +170,7 @@ impl BtleplugTransport {
     pub fn connect(address: &str) -> Result<Self, BtleplugError> {
         let rt = Runtime::new().map_err(|e| BtleplugError::Runtime(e.to_string()))?;
         let (peripheral, addr) = rt.block_on(connect_by_address(address))?;
-        Self::start_background(peripheral, addr, rt)
+        Self::start_background(peripheral, addr, rt, &AtomicBool::new(false))
     }
 
     /// BLE address of the connected device.
@@ -143,34 +179,61 @@ impl BtleplugTransport {
         &self.device_address
     }
 
+    /// Disconnect the peripheral and end the background thread, waiting at
+    /// most 4 s. Later reads and writes fail; later calls return at once.
+    pub(crate) fn disconnect(&mut self) {
+        let _ = self.worker.stop(STOP_TIMEOUT);
+    }
+
+    /// Discover the characteristics, subscribe, and hand the peripheral to
+    /// the background thread. A failure or a cancel disconnects it.
     fn start_background(
         peripheral: Peripheral,
         address: String,
         rt: Runtime,
+        cancel: &AtomicBool,
     ) -> Result<Self, BtleplugError> {
-        // Find characteristics before handing off to background thread.
-        let chars = rt.block_on(async {
-            peripheral.discover_services().await?;
-            find_characteristics(&peripheral)
-        })?;
-
-        // Subscribe to notifications on 2810.
-        rt.block_on(peripheral.subscribe(&chars.notify))?;
+        let setup = rt.block_on(async {
+            // Find characteristics before handing off to background thread.
+            cancelable(cancel, peripheral.discover_services()).await??;
+            let chars = find_characteristics(&peripheral)?;
+            // Subscribe to notifications on 2810.
+            cancelable(cancel, peripheral.subscribe(&chars.notify)).await??;
+            Ok::<_, BtleplugError>(chars)
+        });
+        let chars = match setup {
+            Ok(chars) => chars,
+            Err(e) => {
+                rt.block_on(async {
+                    let _ = tokio::time::timeout(DISCONNECT_TIMEOUT, peripheral.disconnect()).await;
+                });
+                return Err(e);
+            }
+        };
 
         // Channels: notifications (bg → foreground), writes (foreground → bg).
         let (notify_tx, notify_rx) = mpsc::channel::<Vec<u8>>();
         let (write_tx, write_rx) = tokio_mpsc::channel::<WriteCmd>(WRITE_CHANNEL_CAP);
 
-        let bg_thread = thread::spawn(move || {
-            rt.block_on(background_loop(peripheral, chars, notify_tx, write_rx));
-        });
+        let worker = Worker::spawn("tenover-btleplug", move |stop| {
+            rt.block_on(background_loop(
+                peripheral, chars, notify_tx, write_rx, stop,
+            ));
+            rt.shutdown_background();
+        })?;
 
         Ok(Self {
             notify_rx,
             write_tx,
             device_address: address,
-            _bg_thread: bg_thread,
+            worker,
         })
+    }
+}
+
+impl Drop for BtleplugTransport {
+    fn drop(&mut self) {
+        self.disconnect();
     }
 }
 
@@ -236,12 +299,27 @@ fn find_characteristics(peripheral: &Peripheral) -> Result<Chars, BtleplugError>
     })
 }
 
-/// Background async loop: forwards notifications and drains writes.
+/// Background async loop: forwards notifications and drains writes until
+/// `stop` is set or the link fails, then disconnects the peripheral.
 async fn background_loop(
     peripheral: Peripheral,
     chars: Chars,
     notify_tx: mpsc::Sender<Vec<u8>>,
+    write_rx: tokio_mpsc::Receiver<WriteCmd>,
+    stop: Arc<AtomicBool>,
+) {
+    relay(&peripheral, &chars, &notify_tx, write_rx, &stop).await;
+    let _ = tokio::time::timeout(DISCONNECT_TIMEOUT, peripheral.disconnect()).await;
+}
+
+/// Forward notifications and drain writes until `stop` is set, the
+/// foreground is gone, or the link fails.
+async fn relay(
+    peripheral: &Peripheral,
+    chars: &Chars,
+    notify_tx: &mpsc::Sender<Vec<u8>>,
     mut write_rx: tokio_mpsc::Receiver<WriteCmd>,
+    stop: &AtomicBool,
 ) {
     use btleplug::api::Peripheral as _;
     use tokio_stream::StreamExt as _;
@@ -250,9 +328,18 @@ async fn background_loop(
         return;
     };
 
-    loop {
+    // Both inputs closed: nothing is left to relay.
+    let mut notifying = true;
+    let mut writing = true;
+    while (notifying || writing) && !stop.load(Ordering::SeqCst) {
         tokio::select! {
-            Some(notif) = notif_stream.next() => {
+            // Wake up now and then to look at `stop`.
+            () = tokio::time::sleep(CANCEL_POLL) => {}
+            notif = notif_stream.next(), if notifying => {
+                let Some(notif) = notif else {
+                    notifying = false;
+                    continue;
+                };
                 // Only forward notifications from 2810 (our subscribed char).
                 if notif.uuid == CHAR_2810_UUID
                     && notify_tx.send(notif.value).is_err()
@@ -260,55 +347,84 @@ async fn background_loop(
                     break; // foreground dropped
                 }
             }
-            Some(cmd) = write_rx.recv() => {
+            cmd = write_rx.recv(), if writing => {
                 let result = match cmd {
-                    WriteCmd::Data(data) => {
+                    Some(WriteCmd::Data(data)) => {
                         peripheral
                             .write(&chars.data, &data, WriteType::WithoutResponse)
                             .await
                     }
-                    WriteCmd::Register(data) => {
+                    Some(WriteCmd::Register(data)) => {
                         peripheral
                             .write(&chars.register, &data, WriteType::WithResponse)
                             .await
+                    }
+                    None => {
+                        writing = false;
+                        continue;
                     }
                 };
                 if result.is_err() {
                     break; // BLE disconnected
                 }
             }
-            else => break,
+        }
+    }
+}
+
+/// `fut`, or `Err(Canceled)` as soon as `cancel` is set.
+async fn cancelable<F: Future>(cancel: &AtomicBool, fut: F) -> Result<F::Output, BtleplugError> {
+    tokio::pin!(fut);
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(BtleplugError::Canceled);
+        }
+        tokio::select! {
+            out = &mut fut => return Ok(out),
+            () = tokio::time::sleep(CANCEL_POLL) => {}
         }
     }
 }
 
 /// Scan for and connect to a Garmin R10.
-async fn discover_and_connect() -> Result<(Peripheral, String), BtleplugError> {
-    let adapter = get_adapter().await?;
+async fn discover_and_connect(
+    cancel: &AtomicBool,
+    log: &mut dyn FnMut(&str),
+) -> Result<(Peripheral, String), BtleplugError> {
+    let adapter = cancelable(cancel, get_adapter()).await??;
 
     // Scan with no filter — we'll match by name/manufacturer ourselves.
-    eprintln!("  starting BLE scan ({SCAN_TIMEOUT:?})...");
-    adapter.start_scan(ScanFilter::default()).await?;
-    tokio::time::sleep(SCAN_TIMEOUT).await;
-    adapter.stop_scan().await?;
+    log(&format!("starting BLE scan ({SCAN_TIMEOUT:?})"));
+    cancelable(cancel, adapter.start_scan(ScanFilter::default())).await??;
+    let scanned = cancelable(cancel, tokio::time::sleep(SCAN_TIMEOUT)).await;
+    let stopped = tokio::time::timeout(DISCONNECT_TIMEOUT, adapter.stop_scan()).await;
+    scanned?;
+    if let Ok(result) = stopped {
+        result?;
+    }
 
-    let peripherals = adapter.peripherals().await?;
-    eprintln!("  scan found {} peripherals", peripherals.len());
+    let peripherals = cancelable(cancel, adapter.peripherals()).await??;
+    log(&format!("scan found {} peripherals", peripherals.len()));
 
     for p in &peripherals {
         let addr = peripheral_address(p);
-        let name = p
-            .properties()
-            .await
+        let name = cancelable(cancel, p.properties())
+            .await?
             .ok()
             .flatten()
             .and_then(|props| props.local_name.clone())
             .unwrap_or_default();
-        eprintln!("    {addr}  {name:?}");
+        log(&format!("{addr}  {name:?}"));
 
-        if is_r10(p).await {
-            eprintln!("  → matched R10, connecting...");
-            p.connect().await?;
+        if cancelable(cancel, is_r10(p)).await? {
+            log("matched an R10, connecting");
+            match cancelable(cancel, p.connect()).await {
+                Ok(connected) => connected?,
+                Err(canceled) => {
+                    let _ = tokio::time::timeout(DISCONNECT_TIMEOUT, p.disconnect()).await;
+                    return Err(canceled);
+                }
+            }
             return Ok((p.clone(), addr));
         }
     }

@@ -1,140 +1,18 @@
-#![allow(clippy::doc_markdown)]
-//! tenover-frp — Flight Relay Protocol device for Garmin R10.
+//! tenover-frp: a Flight Relay Protocol device for the Garmin R10.
 //!
-//! Connects to a Garmin R10 over BLE, arms it, and streams shot data over FRP
-//! to a controller.
+//! Finds a paired R10 over BLE, arms it, and serves its shots to FRP
+//! controllers, reconnecting whenever the device drops.
 //!
 //! ```text
-//! tenover-frp [frp-target]
+//! tenover-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>]
+//!             [--set <key>=<value>]... [--log <info|debug|trace>] [--help]
 //! ```
 //!
-//! `frp-target` selects the transport direction. A `ws://` or `wss://` URL
-//! bridges this device to a central controller such as flighthook; anything
-//! else is a bind address that controllers connect to. Defaults to
-//! `0.0.0.0:5880`.
+//! `--target` defaults to listening on `0.0.0.0:5880`; a `ws://` URL dials a
+//! controller such as flighthook instead. `--help` lists every config key.
 
-use std::io::Write;
 use std::process::ExitCode;
-use std::thread;
-use std::time::Duration;
-
-use tenover::ble::BleTransport;
-use tenover::frp::FrpDevice;
-use tenover::{Client, Event};
 
 fn main() -> ExitCode {
-    let frp_target = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "0.0.0.0:5880".to_owned());
-    let bridging = frp_target.starts_with("ws://") || frp_target.starts_with("wss://");
-
-    // Open the FRP endpoint first so it connects while we scan for the R10
-    let frp = if bridging {
-        eprintln!("tenover-frp: bridging to controller at {frp_target}");
-        FrpDevice::bridge(&frp_target, "tenover")
-    } else {
-        eprintln!("tenover-frp: serving controllers on {frp_target}");
-        FrpDevice::serve(&frp_target)
-    };
-    let mut frp = match frp {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("tenover-frp: failed to open FRP endpoint: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Connect to R10
-    eprintln!("tenover-frp: searching for Garmin R10...");
-    let transport = match BleTransport::auto_connect() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("tenover-frp: connection failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let addr = transport.device_address().to_owned();
-    let mtu = transport.mtu();
-    eprintln!("tenover-frp: connected  {addr}  mtu={mtu}");
-
-    frp.set_device_name(&format!("Garmin R10 {addr}"));
-    if let Err(e) = frp.send_device_info() {
-        eprintln!("tenover-frp: send device_info failed: {e}");
-    }
-
-    let mut client = Client::new(transport, mtu.into());
-    if let Err(e) = client.start() {
-        eprintln!("tenover-frp: failed to send REGISTER: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    let mut shot_count = 0u32;
-    let mut ready_printed = false;
-
-    loop {
-        match client.poll() {
-            Ok(Some(event)) => {
-                match &event {
-                    Event::Registered { handle } => {
-                        eprintln!("tenover-frp: registered  handle={handle}");
-                    }
-                    Event::HandshakeComplete => {
-                        eprintln!("tenover-frp: handshake complete");
-                    }
-                    Event::Ready => {
-                        if !ready_printed {
-                            eprintln!("tenover-frp: ready");
-                            ready_printed = true;
-                        }
-                    }
-                    Event::StateChange(_) => {
-                        ready_printed = false;
-                    }
-                    Event::Shot(shot) => {
-                        ready_printed = false;
-                        shot_count += 1;
-                        let ball_mph = shot.ball.as_ref().map_or(0.0, |b| b.ball_speed * 2.237);
-                        eprintln!("tenover-frp: shot #{shot_count} — {ball_mph:.1} mph");
-                    }
-                    Event::DeviceError(err) => {
-                        eprintln!("tenover-frp: device error: {err:?}");
-                    }
-                    _ => {}
-                }
-
-                if let Err(e) = frp.handle_event(&event) {
-                    eprintln!("tenover-frp: FRP send error: {e}");
-                }
-
-                // Check for controller commands
-                if let Some(cmd) = frp.check_controller() {
-                    eprintln!(
-                        "tenover-frp: controller command: mode {:?}, hand {:?}, club {:?} \
-                         (R10 does not support mode, hand or club switching)",
-                        cmd.mode, cmd.handed, cmd.club
-                    );
-                }
-            }
-            Ok(None) => {
-                // Adopt a newly established controller connection
-                match frp.poll_connection() {
-                    Ok(true) => eprintln!("tenover-frp: controller connected"),
-                    Ok(false) => {}
-                    Err(e) => eprintln!("tenover-frp: telemetry resend failed: {e}"),
-                }
-
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(tenover::Error::Transport(e)) => {
-                eprintln!("tenover-frp: transport error: {e}");
-                return ExitCode::FAILURE;
-            }
-            Err(e) => {
-                eprintln!("tenover-frp: warning: {e}");
-            }
-        }
-
-        let _ = std::io::stderr().flush();
-    }
+    flightrelay::run::<tenover::driver::R10>()
 }

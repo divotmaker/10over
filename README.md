@@ -20,10 +20,10 @@ poll-based API:
   and state tracking automatically.
 - **`BleTransport`** — platform-agnostic BLE transport (`ble` feature, enabled
   by default). Auto-selects BlueZ on Linux or btleplug on Windows/macOS.
-- **`FrpDevice`** — [Flight Relay Protocol](https://github.com/flightrelay/spec)
-  device (`frp` feature). Bridges R10 shot data to an FRP controller over
-  WebSocket, either serving controllers on a local port (default 5880) or
-  dialing a central controller such as flighthook.
+- **`driver::R10`** — a [flightrelay](https://github.com/flightrelay/sdk-rust)
+  `DeviceDriver` for the R10 (`driver` feature): connect, handshake, arm, and
+  shots as [Flight Relay Protocol](https://github.com/flightrelay/spec) events.
+  The `tenover-frp` binary (`frp` feature) serves it to FRP controllers.
 
 ## Legal Basis — DMCA Section 1201(f)
 
@@ -92,6 +92,29 @@ at your option.
 will change as new message types are decoded and existing ones are refined.
 This crate follows [SemVer](https://semver.org/): until `1.0`, breaking changes
 bump the minor version.
+
+## Migrating from 0.4
+
+0.5 moves to flightrelay 0.5 (FRP 0.2.0). A 0.5 device and a 0.4 controller
+cannot handshake, so controllers move to FRP 0.2.0 too.
+
+| | 0.4 | 0.5 |
+|---|---|---|
+| FRP device API | `FrpDevice`, `ControllerCommand`, the `frp` module | `driver::R10` (a flightrelay `DeviceDriver`) |
+| Shot conversions | `frp::{ball_flight, club_data}` | `driver::convert::{launch, club_data}`; shots carry `launch` |
+| `tenover-frp` target | `tenover-frp <target>` | `tenover-frp --target <target>`, named flags only (see [FRP device](#frp-device-tenover-frp)); several controllers at once |
+| `tenover-frp` model | `Approach R10` | `R10` |
+| Shot with a total spin of 0 | neither total spin nor axis | total spin 0, no axis |
+| `ready` | true at connect; false before a shot and on every device state change | true from the moment the device arms until a shot, false after it |
+| `device_telemetry` | `ready`, identity | adds `source`, `device_state` and `tilt`/`roll` |
+| R10 drops | `tenover-frp` exits | reconnects with a backoff |
+| Handshake | waits as long as it takes | at most 10 s, then a retry |
+| Ctrl-C | ends the process wherever it is | stops the scan, the connect or the session, then exits |
+| BLE dependencies | always compiled | only with `ble` (default); `--no-default-features` pulls none |
+| Connect API | `BleTransport::auto_connect` | adds `auto_connect_with(cancel, log)` (also on `BlueZTransport` and `BtleplugTransport`); `BlueZError` and `BtleplugError` gain `Canceled` |
+| btleplug scan output | printed to stderr | progress lines go to the `log` callback |
+| btleplug close | the peripheral stays connected until it next sends | dropping the transport (or `BleTransport::disconnect`) disconnects it, waiting at most 4 s |
+| BlueZ `auto_connect` | D-Bus calls without a timeout | each D-Bus call times out after 3 s; a `Connect` that times out is waited for, up to 30 s; a connect it started is undone if setup fails |
 
 ## Migrating from 0.2
 
@@ -183,27 +206,67 @@ cargo run --example r10
 cargo build --example r10 --target x86_64-pc-windows-gnu --release
 ```
 
-### FRP device server
+### FRP device (`tenover-frp`)
 
-The `frp` feature adds an FRP device server that makes the R10 appear as a
-standard [FlightRelay](https://github.com/flightrelay/spec) device. Any FRP
-controller (flighthook, dashboards, etc.) can connect over WebSocket and receive
-shot data without knowing anything about the R10 protocol.
+The `driver` feature adds `driver::R10`, a flightrelay `DeviceDriver` that
+makes the R10 a standard [Flight Relay Protocol](https://github.com/flightrelay/spec)
+(FRP 0.2.0) device. Any FRP controller (flighthook, dashboards, etc.) receives
+shot data without knowing anything about the R10 protocol. The `frp` feature
+builds `tenover-frp`, which serves the driver over WebSocket:
 
-`FrpDevice::check_controller()` returns the controller's `set_detection_mode`
-request as a `ControllerCommand` (`mode`, `handed`, `club`, each `None` when
-absent or unrecognized). The R10 has no mode, hand or club switching, so the
-request is informational.
+```text
+tenover-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>]
+            [--set <key>=<value>]... [--log <info|debug|trace>] [--help]
+```
 
-A standalone binary is included:
+| Flag | Meaning |
+|------|---------|
+| `--target` | An address to listen on (default `0.0.0.0:5880`; several controllers may connect), or a `ws://` URL to dial a controller such as flighthook |
+| `--config` | A TOML file with the config keys at the top level |
+| `--set key=value` | Set one config key, after the file; repeatable |
+| `--log` | The lowest level of log lines printed to stderr (default `info`) |
+| `--help` | Usage and every config key |
+
+Config keys:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `range` | unset | Distance from the R10 to the tee, e.g. `"7ft"` or `"2.1m"`, sent to the device once it wakes. Unset leaves the device's own setting alone |
 
 ```sh
-# Discover and connect to R10, serve FRP on port 5880
+# Find a paired R10, serve FRP on port 5880
 cargo run --features frp --bin tenover-frp
 
-# Custom FRP bind address
-cargo run --features frp --bin tenover-frp -- 0.0.0.0:9000
+# Another port, with a tee distance
+cargo run --features frp --bin tenover-frp -- --target 0.0.0.0:9000 --set range=7ft
+
+# Dial flighthook
+cargo run --features frp --bin tenover-frp -- --target ws://flighthook:5880/frp
 ```
+
+The binary reconnects whenever the R10 drops (it sleeps, or goes out of
+range), with a backoff that grows by 1 s per failed attempt up to 15 s and
+starts over after a session of 10 s or more. Ctrl-C stops it cleanly, even
+during a BLE scan.
+
+What the device sends over FRP:
+
+- `device_telemetry` with `source: "measured"`, manufacturer `Garmin` and
+  model `R10` before the first shot; `ready`, `device_state` (`waiting`,
+  `recording`, `processing`), and `tilt`/`roll` (`ok`, or the angles the
+  device reports with a leveling error);
+- per shot: `shot_trigger`, `launch` (launch speed, both launch angles, and
+  total spin, spin axis, backspin and sidespin, all measured; a total spin of
+  0 is sent as 0 with no axis), `club_path` (club speed, face, path, attack
+  angle) and `shot_finished`. The R10 reports no flight result;
+- device errors as alerts;
+- `raw_frame`s, only to a controller that asks: one per GFDI message, labeled
+  `notify <type>` or `write <type>` (the message type in hex). Messages that
+  carry the device's identity or keys, and everything before the handshake
+  finished, are never sent.
+
+The R10 has no detection mode, hand or club setting, so a controller's
+`set_detection_mode` is ignored.
 
 Pre-built binaries for Linux and Windows are attached to each
 [GitHub release](https://github.com/divotmaker/10over/releases).
@@ -213,7 +276,9 @@ Pre-built binaries for Linux and Windows are attached to each
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `ble` | Yes | Platform-agnostic BLE transport (BlueZ on Linux, btleplug on Windows/macOS) |
-| `frp` | No | FRP WebSocket device server ([FlightRelay](https://github.com/flightrelay/spec)) |
+| `config` | No | The driver's settings (`config::Config`), with no BLE stack: builds for `wasm32-unknown-unknown` |
+| `driver` | No | The flightrelay `DeviceDriver` for the R10 (`driver::R10`); implies `config` and `ble` |
+| `frp` | No | The `tenover-frp` binary; implies `driver` |
 | `serde` | No | Serialize/deserialize shot data types |
 | `testing` | No | Frame builders with synthetic device identity, for downstream tests (`tenover::testing`) |
 
@@ -221,7 +286,10 @@ Pre-built binaries for Linux and Windows are attached to each
 # Protocol-only (no BLE transport)
 cargo build --no-default-features
 
-# With FRP server
+# Settings only, e.g. for a WebAssembly settings form
+cargo build --no-default-features --features config --target wasm32-unknown-unknown
+
+# With the FRP binary
 cargo build --features frp
 ```
 
@@ -260,7 +328,8 @@ Minimal by design:
 - **`thiserror`** — error enum derives
 - **`zbus`** + **`libc`** (Linux, `ble` feature) — BlueZ D-Bus transport
 - **`btleplug`** + **`tokio`** (Windows/macOS, `ble` feature) — cross-platform BLE
-- **`flightrelay`** (optional, `frp` feature) — FRP WebSocket server
+- **`flightrelay`** (optional, `config`/`driver`/`frp` features) — driver
+  contract, settings, and the FRP server
 - **`serde`** (optional, `serde` feature) — serialization support
 
 No async runtime in the public API. The btleplug backend runs tokio internally

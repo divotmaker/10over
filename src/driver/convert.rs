@@ -1,31 +1,28 @@
-//! Convert 10over shot data types to FRP domain types.
+//! Convert tenover shot data to FRP types.
 
-use flightrelay::types::{BallFlight, ClubData as FrpClubData};
+use flightrelay::types::{ClubData as FrpClubData, Launch};
 use flightrelay::units::Velocity;
 
 use crate::proto::{BallData, ClubData};
 
-/// Convert [`BallData`] to an FRP [`BallFlight`].
+/// Convert [`BallData`] to an FRP [`Launch`].
 ///
-/// The R10 provides launch speed, angles, and spin. It reports total spin and
-/// spin axis; both are sent along with the backspin and sidespin components
-/// computed from them. A total spin of 0 sends neither total spin nor axis.
-/// It does not compute carry, landing, total distance, max height, or flight
-/// time — those fields are left as `None`.
+/// The R10 reports launch speed, both launch angles, total spin and spin
+/// axis. Total spin and axis are sent with the backspin and sidespin
+/// computed from them, all four as measured values. A total spin of 0 is
+/// sent as 0 with no axis. The R10 reports no flight result.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)]
-pub fn ball_flight(b: &BallData) -> BallFlight {
+#[allow(clippy::cast_possible_truncation)] // spin rates fit an i32
+pub fn launch(b: &BallData) -> Launch {
     let total_spin = b.total_spin.round() as i32;
-    let spin_measured = total_spin > 0;
-    BallFlight {
+    Launch {
         launch_speed: Some(Velocity::MetersPerSecond(f64::from(b.ball_speed))),
         launch_azimuth: Some(f64::from(b.launch_direction)),
         launch_elevation: Some(f64::from(b.launch_angle)),
         backspin_rpm: Some(b.backspin.round() as i32),
         sidespin_rpm: Some(b.sidespin.round() as i32),
-        total_spin_rpm: spin_measured.then_some(total_spin),
-        spin_axis: spin_measured.then_some(f64::from(b.spin_axis)),
-        ..BallFlight::default()
+        total_spin_rpm: Some(total_spin),
+        spin_axis: (total_spin != 0).then_some(f64::from(b.spin_axis)),
     }
 }
 
@@ -66,8 +63,8 @@ mod tests {
     }
 
     #[test]
-    fn ball_flight_conversion() {
-        let frp = ball_flight(&ball_data(2800.0, 5.0));
+    fn launch_conversion() {
+        let frp = launch(&ball_data(2800.0, 5.0));
         assert_eq!(
             frp.launch_speed,
             Some(Velocity::MetersPerSecond(f64::from(67.2_f32)))
@@ -78,34 +75,27 @@ mod tests {
         assert_eq!(frp.sidespin_rpm, Some(244));
         assert_eq!(frp.total_spin_rpm, Some(2800));
         assert_eq!(frp.spin_axis, Some(5.0));
-        // R10 doesn't provide these
-        assert_eq!(frp.carry_distance, None);
-        assert_eq!(frp.carry_offline, None);
-        assert_eq!(frp.total_distance, None);
-        assert_eq!(frp.total_offline, None);
-        assert_eq!(frp.flight_time, None);
-        assert_eq!(frp.descent_angle, None);
     }
 
     #[test]
     fn spin_axis_sign_matches_sidespin() {
         // Axis tilted right: ball curves right, sidespin positive.
-        let right = ball_flight(&ball_data(3000.0, 12.0));
+        let right = launch(&ball_data(3000.0, 12.0));
         assert_eq!(right.spin_axis, Some(12.0));
         assert!(right.sidespin_rpm.unwrap() > 0);
         // Axis tilted left: ball curves left, sidespin negative.
-        let left = ball_flight(&ball_data(3000.0, -12.0));
+        let left = launch(&ball_data(3000.0, -12.0));
         assert_eq!(left.spin_axis, Some(-12.0));
         assert!(left.sidespin_rpm.unwrap() < 0);
     }
 
     #[test]
     fn spin_pairs_agree() {
-        let frp = ball_flight(&ball_data(4321.0, -17.5));
-        let mut components = BallFlight {
+        let frp = launch(&ball_data(4321.0, -17.5));
+        let mut components = Launch {
             backspin_rpm: frp.backspin_rpm,
             sidespin_rpm: frp.sidespin_rpm,
-            ..BallFlight::default()
+            ..Launch::default()
         };
         components.complete_spin();
         assert_eq!(components.total_spin_rpm, frp.total_spin_rpm);
@@ -114,9 +104,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_total_spin_sends_neither_total_nor_axis() {
-        let frp = ball_flight(&ball_data(0.0, 0.0));
-        assert_eq!(frp.total_spin_rpm, None);
+    fn zero_total_spin_sends_total_zero_and_no_axis() {
+        let frp = launch(&ball_data(0.0, 3.0));
+        assert_eq!(frp.total_spin_rpm, Some(0));
         assert_eq!(frp.spin_axis, None);
         assert_eq!(frp.backspin_rpm, Some(0));
         assert_eq!(frp.sidespin_rpm, Some(0));

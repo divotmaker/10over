@@ -26,8 +26,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use zbus::blocking::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
@@ -47,6 +48,17 @@ const OBJECT_MANAGER_IFACE: &str = "org.freedesktop.DBus.ObjectManager";
 
 /// R10 device name as reported by BLE advertisement.
 const R10_DEVICE_NAME: &str = "Approach R10";
+
+/// Longest any one D-Bus call may take on the connection
+/// [`BlueZTransport::auto_connect_with`] uses.
+const METHOD_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a connect may go on after its `Connect` call timed out: BlueZ
+/// keeps connecting, and the device shows as connected once it is.
+const CONNECT_WAIT: Duration = Duration::from_secs(30);
+/// How often a wait looks at the device and the cancel flag.
+const POLL_SLICE: Duration = Duration::from_millis(100);
+/// Polls of `ServicesResolved` before giving up (5 s).
+const SERVICES_POLLS: u32 = 50;
 
 /// Errors from BlueZ transport setup.
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +82,10 @@ pub enum BlueZError {
     /// I/O error during fd setup.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+
+    /// The caller's cancel flag was set.
+    #[error("canceled")]
+    Canceled,
 }
 
 /// BlueZ file-descriptor transport for the Garmin R10.
@@ -103,10 +119,43 @@ impl BlueZTransport {
     /// Returns [`BlueZError`] if no paired R10 is found, the connection times out,
     /// or fd acquisition fails.
     pub fn auto_connect() -> Result<Self, BlueZError> {
-        let conn = Connection::system()?;
+        Self::auto_connect_with(&AtomicBool::new(false), &mut |_| {})
+    }
+
+    /// [`auto_connect`](Self::auto_connect) that a caller can cut short.
+    ///
+    /// Setting `cancel` (from another thread) ends the attempt with
+    /// [`BlueZError::Canceled`] within about 6 s: every D-Bus call has a 3 s
+    /// timeout, the flag is checked between calls and every 100 ms while
+    /// waiting, and a connect this call started is disconnected again. A
+    /// `Connect` that times out is waited for, up to 30 s, while BlueZ keeps
+    /// connecting. `log` receives progress lines.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BlueZError`] if no paired R10 is found, the connection times
+    /// out, fd acquisition fails, or `cancel` was set.
+    pub fn auto_connect_with(
+        cancel: &AtomicBool,
+        log: &mut dyn FnMut(&str),
+    ) -> Result<Self, BlueZError> {
+        let conn = zbus::blocking::connection::Builder::system()?
+            .method_timeout(METHOD_TIMEOUT)
+            .build()?;
+        check(cancel)?;
         let (device_path, address) = find_r10(&conn)?;
-        ensure_connected(&conn, &device_path)?;
-        Self::acquire_fds(conn, &device_path, address)
+        log("found a paired R10");
+        check(cancel)?;
+        let device = DbusDevice {
+            conn: &conn,
+            path: &device_path,
+        };
+        let started = ensure_connected(&device, cancel, log)?;
+        let transport = Self::acquire_fds(conn.clone(), &device_path, address, cancel);
+        if started && transport.is_err() {
+            disconnect(&conn, &device_path);
+        }
+        transport
     }
 
     /// Connect to a paired R10 at a known BlueZ D-Bus path.
@@ -122,7 +171,7 @@ impl BlueZTransport {
     pub fn connect(device_path: &str) -> Result<Self, BlueZError> {
         let conn = Connection::system()?;
         let address = address_from_path(device_path);
-        Self::acquire_fds(conn, device_path, address)
+        Self::acquire_fds(conn, device_path, address, &AtomicBool::new(false))
     }
 
     /// BLE MTU reported by BlueZ (minimum of notify and write MTUs).
@@ -141,14 +190,18 @@ impl BlueZTransport {
         conn: Connection,
         device_path: &str,
         device_address: String,
+        cancel: &AtomicBool,
     ) -> Result<Self, BlueZError> {
         let (path_2810, path_2820) = discover_characteristics(&conn, device_path)?;
+        check(cancel)?;
 
         // AcquireNotify on 2810 → notify_fd (all inbound notifications)
         let (notify_fd, notify_mtu) = acquire_fd(&conn, &path_2810, "AcquireNotify")?;
+        check(cancel)?;
 
         // AcquireWrite on 2810 → register_fd (MultiLink REGISTER command)
         let (register_fd, _) = acquire_fd(&conn, &path_2810, "AcquireWrite")?;
+        check(cancel)?;
 
         // AcquireWrite on 2820 → write_fd (GFDI data with handle prefix)
         let (write_fd, write_mtu) = acquire_fd(&conn, &path_2820, "AcquireWrite")?;
@@ -229,21 +282,127 @@ fn address_from_path(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Ensure the device is connected and GATT services are resolved.
-fn ensure_connected(conn: &Connection, device_path: &str) -> Result<(), BlueZError> {
-    if !get_device_bool(conn, device_path, "Connected")? {
-        let proxy = zbus::blocking::Proxy::new(conn, BLUEZ_DEST, device_path, DEVICE_IFACE)?;
-        proxy.call_method("Connect", &())?;
+/// `Err(Canceled)` once `cancel` is set.
+fn check(cancel: &AtomicBool) -> Result<(), BlueZError> {
+    if cancel.load(Ordering::SeqCst) {
+        Err(BlueZError::Canceled)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether a D-Bus call failed because it hit the connection's method
+/// timeout.
+fn is_timeout(e: &zbus::Error) -> bool {
+    matches!(e, zbus::Error::InputOutput(io) if io.kind() == io::ErrorKind::TimedOut)
+}
+
+/// Ask BlueZ to drop the device's connection. Best effort: used to undo a
+/// connect that is no longer wanted.
+fn disconnect(conn: &Connection, device_path: &str) {
+    if let Ok(proxy) = zbus::blocking::Proxy::new(conn, BLUEZ_DEST, device_path, DEVICE_IFACE) {
+        let _ = proxy.call_method("Disconnect", &());
+    }
+}
+
+/// The BlueZ calls [`ensure_connected`] makes on one device.
+trait Device {
+    /// The device's `Connected` property.
+    fn connected(&self) -> Result<bool, BlueZError>;
+    /// The device's `ServicesResolved` property.
+    fn services_resolved(&self) -> Result<bool, BlueZError>;
+    /// `Device1.Connect`.
+    fn connect(&self) -> Result<(), zbus::Error>;
+    /// `Device1.Disconnect`, best effort.
+    fn disconnect(&self);
+    /// Wait between two looks at the device.
+    fn pause(&self) {
+        thread::sleep(POLL_SLICE);
+    }
+}
+
+/// A BlueZ device on a D-Bus connection.
+struct DbusDevice<'a> {
+    conn: &'a Connection,
+    path: &'a str,
+}
+
+impl Device for DbusDevice<'_> {
+    fn connected(&self) -> Result<bool, BlueZError> {
+        get_device_bool(self.conn, self.path, "Connected")
     }
 
-    // Wait for GATT service resolution (up to 5s, usually instant from cache)
-    for _ in 0..50 {
-        if get_device_bool(conn, device_path, "ServicesResolved")? {
+    fn services_resolved(&self) -> Result<bool, BlueZError> {
+        get_device_bool(self.conn, self.path, "ServicesResolved")
+    }
+
+    fn connect(&self) -> Result<(), zbus::Error> {
+        let proxy = zbus::blocking::Proxy::new(self.conn, BLUEZ_DEST, self.path, DEVICE_IFACE)?;
+        proxy.call_method("Connect", &()).map(drop)
+    }
+
+    fn disconnect(&self) {
+        disconnect(self.conn, self.path);
+    }
+}
+
+/// Ensure the device is connected and GATT services are resolved. Returns
+/// whether this call started the connection. A connect it started is
+/// disconnected again when anything after it fails: `cancel` is set, the
+/// connect or the services wait times out, or a D-Bus call fails.
+fn ensure_connected(
+    device: &impl Device,
+    cancel: &AtomicBool,
+    log: &mut dyn FnMut(&str),
+) -> Result<bool, BlueZError> {
+    if device.connected()? {
+        wait_services(device, cancel)?;
+        return Ok(false);
+    }
+    log("connecting");
+    let result = connect(device, cancel, log).and_then(|()| wait_services(device, cancel));
+    if result.is_err() {
+        device.disconnect();
+    }
+    result.map(|()| true)
+}
+
+/// `Connect`, and when the call times out, wait up to [`CONNECT_WAIT`] for
+/// BlueZ to finish connecting.
+fn connect(
+    device: &impl Device,
+    cancel: &AtomicBool,
+    log: &mut dyn FnMut(&str),
+) -> Result<(), BlueZError> {
+    match device.connect() {
+        Ok(()) => Ok(()),
+        Err(e) if is_timeout(&e) => {
+            log("still connecting");
+            let deadline = Instant::now() + CONNECT_WAIT;
+            loop {
+                check(cancel)?;
+                if device.connected()? {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(e.into());
+                }
+                device.pause();
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Wait for GATT service resolution (up to 5 s, usually instant from cache).
+fn wait_services(device: &impl Device, cancel: &AtomicBool) -> Result<(), BlueZError> {
+    for _ in 0..SERVICES_POLLS {
+        check(cancel)?;
+        if device.services_resolved()? {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(100));
+        device.pause();
     }
-
     Err(BlueZError::ServicesTimeout)
 }
 
@@ -352,4 +511,105 @@ fn prop_bool(props: &HashMap<String, OwnedValue>, key: &str) -> bool {
     props
         .get(key)
         .is_some_and(|v| matches!(&**v, Value::Bool(true)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// A device whose answers the test sets, counting disconnects.
+    #[derive(Default)]
+    struct Fake {
+        connected: Cell<bool>,
+        resolves: bool,
+        connect_times_out: bool,
+        /// Set the cancel flag on the first pause.
+        cancel_on_pause: Option<Arc<AtomicBool>>,
+        disconnects: Cell<u32>,
+    }
+
+    impl Device for Fake {
+        fn connected(&self) -> Result<bool, BlueZError> {
+            Ok(self.connected.get())
+        }
+
+        fn services_resolved(&self) -> Result<bool, BlueZError> {
+            Ok(self.resolves)
+        }
+
+        fn connect(&self) -> Result<(), zbus::Error> {
+            if self.connect_times_out {
+                return Err(zbus::Error::InputOutput(Arc::new(
+                    io::ErrorKind::TimedOut.into(),
+                )));
+            }
+            self.connected.set(true);
+            Ok(())
+        }
+
+        fn disconnect(&self) {
+            self.disconnects.set(self.disconnects.get() + 1);
+        }
+
+        fn pause(&self) {
+            if let Some(cancel) = &self.cancel_on_pause {
+                cancel.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn run(device: &Fake, cancel: &AtomicBool) -> Result<bool, BlueZError> {
+        ensure_connected(device, cancel, &mut |_| {})
+    }
+
+    #[test]
+    fn a_services_timeout_undoes_a_connect_this_call_started() {
+        let device = Fake::default();
+        let err = run(&device, &AtomicBool::new(false)).unwrap_err();
+        assert!(matches!(err, BlueZError::ServicesTimeout), "{err}");
+        assert_eq!(device.disconnects.get(), 1);
+    }
+
+    #[test]
+    fn a_services_timeout_leaves_an_existing_connection_alone() {
+        let device = Fake {
+            connected: Cell::new(true),
+            ..Fake::default()
+        };
+        let err = run(&device, &AtomicBool::new(false)).unwrap_err();
+        assert!(matches!(err, BlueZError::ServicesTimeout), "{err}");
+        assert_eq!(device.disconnects.get(), 0);
+    }
+
+    #[test]
+    fn a_resolved_connect_is_kept() {
+        let device = Fake {
+            resolves: true,
+            ..Fake::default()
+        };
+        assert!(run(&device, &AtomicBool::new(false)).expect("connected"));
+        assert_eq!(device.disconnects.get(), 0);
+        let device = Fake {
+            connected: Cell::new(true),
+            resolves: true,
+            ..Fake::default()
+        };
+        assert!(!run(&device, &AtomicBool::new(false)).expect("connected"));
+    }
+
+    #[test]
+    fn a_cancel_while_a_timed_out_connect_goes_on_undoes_it() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let device = Fake {
+            connect_times_out: true,
+            cancel_on_pause: Some(Arc::clone(&cancel)),
+            ..Fake::default()
+        };
+        let err = run(&device, &cancel).unwrap_err();
+        assert!(matches!(err, BlueZError::Canceled), "{err}");
+        assert_eq!(device.disconnects.get(), 1);
+    }
 }

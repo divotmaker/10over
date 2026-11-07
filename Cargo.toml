@@ -12,9 +12,22 @@ categories = ["network-programming", "parser-implementations"]
 
 [features]
 default = ["ble"]
-ble = []
+# The platform BLE transport: BlueZ on Linux, btleplug elsewhere.
+ble = [
+    "dep:zbus",
+    "dep:libc",
+    "dep:btleplug",
+    "dep:tokio",
+    "dep:tokio-stream",
+    "dep:uuid",
+]
 serde = ["dep:serde"]
-frp = ["dep:flightrelay"]
+# The driver's settings (`config::Config`), with no BLE stack.
+config = ["dep:flightrelay", "flightrelay/config", "serde"]
+# The flightrelay `DeviceDriver` for the R10 (`driver::R10`).
+driver = ["config", "ble", "flightrelay/driver"]
+# The `tenover-frp` binary: the driver served over FRP.
+frp = ["driver", "flightrelay/server", "flightrelay/main"]
 # Frame builders with synthetic device identity, for downstream tests.
 testing = []
 
@@ -25,24 +38,30 @@ all-features = true
 prost = "0.13"
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
-flightrelay = { version = "0.4", features = ["transport"], optional = true }
+flightrelay = { version = "0.5", default-features = false, optional = true }
 
-# BLE backend deps are target-conditional: only the right platform's deps
-# are compiled. The `ble` feature (default) controls whether the ble module
-# and transport backends are included in the build.
+# BLE backend deps are optional and target-conditional: the `ble` feature
+# (default) turns them on, and only the right platform's deps are compiled.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = "5"
-libc = "0.2"
+zbus = { version = "5", optional = true }
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-btleplug = "0.11"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
-tokio-stream = "0.1"
-uuid = "1"
+btleplug = { version = "0.11", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+uuid = { version = "1", optional = true }
 
 [[bin]]
 name = "tenover-frp"
-required-features = ["ble", "frp"]
+required-features = ["frp"]
+
+[[example]]
+name = "r10"
+required-features = ["ble"]
+
+[dev-dependencies]
+serde_json = "1"
 
 [build-dependencies]
 prost-build = "0.13"
