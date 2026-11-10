@@ -191,7 +191,29 @@ impl Rig {
 }
 
 fn driver(range: Option<Distance>) -> R10 {
-    R10::new(Config { range }).expect("valid config")
+    R10::new(Config {
+        range,
+        ..Config::default()
+    })
+    .expect("valid config")
+}
+
+fn aimed_driver(aim_offset_deg: f64) -> R10 {
+    R10::new(Config {
+        aim_offset_deg: Some(aim_offset_deg),
+        ..Config::default()
+    })
+    .expect("valid config")
+}
+
+fn club_paths(events: &[FrpEvent]) -> Vec<flightrelay::types::ClubData> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            FrpEvent::ClubPath { club, .. } => Some(club.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn kinds(events: &[FrpEvent]) -> Vec<&'static str> {
@@ -278,9 +300,16 @@ fn info_names_a_measured_exclusive_garmin() {
 fn new_refuses_an_invalid_config() {
     let err = R10::new(Config {
         range: Some(Distance::Feet(-1.0)),
+        ..Config::default()
     })
     .unwrap_err();
     assert_eq!(err.field.as_deref(), Some("range"));
+    let err = R10::new(Config {
+        aim_offset_deg: Some(11.0),
+        ..Config::default()
+    })
+    .unwrap_err();
+    assert_eq!(err.field.as_deref(), Some("aim_offset_deg"));
 }
 
 #[test]
@@ -386,6 +415,88 @@ fn zero_spin_shot_sends_total_zero_with_no_axis() {
     let launch = &launches(&rig.frp())[0];
     assert_eq!(launch.total_spin_rpm, Some(0));
     assert_eq!(launch.spin_axis, None);
+}
+
+/// The first launch and club path of one shot (device shot 5).
+fn aimed_shot(d: &mut R10, envelope: &[u8]) -> (Launch, flightrelay::types::ClubData) {
+    let fake = Fake::default();
+    let mut rig = Rig::new(false);
+    let mut session = armed(&mut rig, d, &fake);
+    rig.frp();
+    fake.send_envelope(envelope);
+    rig.poll(&mut session).expect("poll");
+    let frp = rig.frp();
+    (launches(&frp)[0].clone(), club_paths(&frp)[0].clone())
+}
+
+#[test]
+fn the_aim_offset_corrects_the_horizontal_angles_of_a_tracked_shot() {
+    let shot = testing::shot_envelope(5, 2800.0, 5.0);
+    let (plain_launch, plain_club) = aimed_shot(&mut driver(None), &shot);
+    assert_eq!(plain_launch.launch_azimuth, Some(f64::from(-1.2_f32)));
+    assert_eq!(plain_club.face_angle, Some(1.5));
+    assert_eq!(plain_club.path, Some(-2.0));
+
+    let (launch, club) = aimed_shot(&mut aimed_driver(1.5), &shot);
+    assert_eq!(launch.launch_azimuth, Some(f64::from(-1.2_f32) + 1.5));
+    assert_eq!(club.face_angle, Some(3.0));
+    assert_eq!(club.path, Some(-0.5));
+    // Elevation, spin and the vertical club angle are the device's.
+    assert_eq!(
+        Launch {
+            launch_azimuth: plain_launch.launch_azimuth,
+            ..launch
+        },
+        plain_launch
+    );
+    assert_eq!(club.attack_angle, plain_club.attack_angle);
+    assert_eq!(club.club_speed, plain_club.club_speed);
+}
+
+#[test]
+fn the_aim_offset_leaves_an_untracked_club_alone() {
+    let shot = testing::shot_envelope_untracked_club(5, 2800.0, 5.0);
+    let (launch, club) = aimed_shot(&mut aimed_driver(-2.0), &shot);
+    assert_eq!(launch.launch_azimuth, Some(f64::from(-1.2_f32) - 2.0));
+    assert_eq!(club.face_angle, Some(0.0));
+    assert_eq!(club.path, Some(0.0));
+    assert_eq!(club.attack_angle, Some(0.0));
+}
+
+#[test]
+fn a_new_aim_offset_applies_to_the_running_session() {
+    let fake = Fake::default();
+    let mut rig = Rig::new(false);
+    let mut d = driver(None);
+    let mut session = armed(&mut rig, &mut d, &fake);
+    rig.frp();
+    fake.send_envelope(&testing::shot_envelope(1, 2800.0, 5.0));
+    rig.poll(&mut session).expect("poll");
+    assert_eq!(
+        launches(&rig.frp())[0].launch_azimuth,
+        Some(f64::from(-1.2_f32))
+    );
+
+    let aimed = Config {
+        aim_offset_deg: Some(1.2),
+        ..Config::default()
+    };
+    assert!(!Config::restart_needed(d.config(), &aimed));
+    d.apply_config(&aimed);
+    fake.send_envelope(&testing::shot_envelope(2, 2800.0, 5.0));
+    rig.poll(&mut session).expect("poll");
+    assert_eq!(
+        launches(&rig.frp())[0].launch_azimuth,
+        Some(f64::from(-1.2_f32) + 1.2)
+    );
+
+    d.apply_config(&Config::default());
+    fake.send_envelope(&testing::shot_envelope(3, 2800.0, 5.0));
+    rig.poll(&mut session).expect("poll");
+    assert_eq!(
+        launches(&rig.frp())[0].launch_azimuth,
+        Some(f64::from(-1.2_f32))
+    );
 }
 
 #[test]
@@ -774,6 +885,7 @@ fn identity_messages_are_classified_by_type() {
 #[test]
 fn help_lists_the_optional_range() {
     assert!(Config::help_toml().contains("# range = (unset)"));
+    assert!(Config::help_toml().contains("# aim_offset_deg = (unset)"));
     let config = Config::from_toml_str("range = \"7ft\"").expect("valid");
     assert_eq!(config.range, Some(Distance::Feet(7.0)));
     let err = Config::from_toml_str("range = \"0yd\"").unwrap_err();
@@ -793,5 +905,6 @@ fn run_refuses_unknown_keys_and_invalid_values() {
     assert_eq!(run(&["--set", "rnage=7ft"]), ExitCode::from(2));
     assert_eq!(run(&["--set", "range=0ft"]), ExitCode::from(2));
     assert_eq!(run(&["--set", "range=seven"]), ExitCode::from(2));
+    assert_eq!(run(&["--set", "aim_offset_deg=11"]), ExitCode::from(2));
     assert_eq!(run(&["--help"]), ExitCode::SUCCESS);
 }

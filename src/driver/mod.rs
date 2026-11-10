@@ -28,7 +28,10 @@
 //!
 //! The R10 has no detection mode, hand or club setting, so commands are
 //! ignored. The configured tee distance ([`Config::range`]) is sent once the
-//! device wakes; changing it takes a new session.
+//! device wakes; changing it takes a new session. The aim offset
+//! ([`Config::aim_offset_deg`], **beta**) corrects the horizontal angles of
+//! the FRP output ([`convert`]); a change reaches the running session and
+//! applies from the next shot.
 //!
 //! The handshake must finish within 10 s of its start, however much the
 //! device sends meanwhile. Closing or dropping a session on Windows and
@@ -45,7 +48,7 @@ use std::time::{Duration, Instant};
 
 use flightrelay::driver::{
     Backoff, ConfigError, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverConfig,
-    DriverInfo, Events, Level, NoAction, RawProfile, SessionEnd, ShotIds, Stop, Stopped,
+    DriverInfo, Events, Level, Live, NoAction, RawProfile, SessionEnd, ShotIds, Stop, Stopped,
 };
 use flightrelay::{FrpEvent, RawFrame, Severity, Source};
 
@@ -97,6 +100,8 @@ impl From<Stopped> for Error {
 pub struct R10 {
     config: Config,
     ids: ShotIds,
+    /// [`Config::aim_offset`], shared with the sessions.
+    aim_offset: Live<f64>,
     /// [`HANDSHAKE_TIMEOUT`]; tests shorten it.
     handshake_timeout: Duration,
 }
@@ -141,6 +146,7 @@ impl R10 {
             client: Client::new(Tap::new(transport), mtu),
             identity,
             ids: self.ids.clone(),
+            aim_offset: self.aim_offset.clone(),
             tee_distance_yd: self.config.tee_distance_yd(),
             release,
         };
@@ -207,6 +213,7 @@ impl DeviceDriver for R10 {
     fn new(config: Config) -> Result<Self, ConfigError> {
         config.validate()?;
         Ok(Self {
+            aim_offset: Live::new(config.aim_offset()),
             config,
             ids: ShotIds::new(),
             handshake_timeout: HANDSHAKE_TIMEOUT,
@@ -252,6 +259,7 @@ impl DeviceDriver for R10 {
     }
 
     fn apply_config(&mut self, new: &Config) {
+        self.aim_offset.set(new.aim_offset());
         self.config = new.clone();
     }
 }
@@ -333,6 +341,7 @@ pub struct R10Session<T: Transport = BleTransport> {
     client: Client<Tap<T>>,
     identity: DeviceIdentity,
     ids: ShotIds,
+    aim_offset: Live<f64>,
     tee_distance_yd: Option<f32>,
     /// Frees the device on close.
     release: fn(&mut T),
@@ -456,11 +465,12 @@ impl<T: Transport> R10Session<T> {
                     format!("shot #{} (device shot {})", key.shot_number, shot.shot_id),
                 );
                 out.shot_trigger(key.clone());
+                let aim = self.aim_offset.get();
                 if let Some(ball) = &shot.ball {
-                    out.launch(key.clone(), convert::launch(ball));
+                    out.launch(key.clone(), convert::launch(ball, aim));
                 }
                 if let Some(club) = &shot.club {
-                    out.club_path(key.clone(), convert::club_data(club));
+                    out.club_path(key.clone(), convert::club_data(club, aim));
                 }
                 out.shot_finished(key);
                 out.ready(false);

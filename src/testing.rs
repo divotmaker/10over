@@ -113,10 +113,52 @@ fn report_envelope(report: monitor::MonitorReport) -> Vec<u8> {
 }
 
 /// A regular shot with ball and club data: ball speed 67 m/s, launch 12.5°
-/// up and 1.2° left, `total_spin_rpm` about `spin_axis_deg`; club speed 44
+/// up and 1.2° left, `total_spin_rpm` about the wire's `spin_axis_deg` (the
+/// device's sign: + tilts left, so tenover decodes it negated); club speed 44
 /// m/s, face 1.5°, path -2°, attack -3.5°.
 #[must_use]
 pub fn shot_envelope(shot_id: u32, total_spin_rpm: f32, spin_axis_deg: f32) -> Vec<u8> {
+    shot_with_club(
+        shot_id,
+        total_spin_rpm,
+        spin_axis_deg,
+        monitor::ClubDelivery {
+            head_speed_mps: Some(44.0),
+            face_deg: Some(1.5),
+            path_deg: Some(-2.0),
+            attack_deg: Some(-3.5),
+        },
+    )
+}
+
+/// A regular shot like [`shot_envelope`] whose club the device did not
+/// track, as on a slow swing: club speed 30 m/s with face, path and attack
+/// all exactly 0.
+#[must_use]
+pub fn shot_envelope_untracked_club(
+    shot_id: u32,
+    total_spin_rpm: f32,
+    spin_axis_deg: f32,
+) -> Vec<u8> {
+    shot_with_club(
+        shot_id,
+        total_spin_rpm,
+        spin_axis_deg,
+        monitor::ClubDelivery {
+            head_speed_mps: Some(30.0),
+            face_deg: Some(0.0),
+            path_deg: Some(0.0),
+            attack_deg: Some(0.0),
+        },
+    )
+}
+
+fn shot_with_club(
+    shot_id: u32,
+    total_spin_rpm: f32,
+    spin_axis_deg: f32,
+    club: monitor::ClubDelivery,
+) -> Vec<u8> {
     report_envelope(monitor::MonitorReport {
         shot: Some(monitor::ShotReadout {
             shot_number: Some(shot_id),
@@ -130,12 +172,7 @@ pub fn shot_envelope(shot_id: u32, total_spin_rpm: f32, spin_axis_deg: f32) -> V
                 spin_source: Some(0),
                 marking: None,
             }),
-            club: Some(monitor::ClubDelivery {
-                head_speed_mps: Some(44.0),
-                face_deg: Some(1.5),
-                path_deg: Some(-2.0),
-                attack_deg: Some(-3.5),
-            }),
+            club: Some(club),
             timing: None,
         }),
         ..monitor::MonitorReport::default()

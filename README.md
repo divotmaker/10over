@@ -232,6 +232,7 @@ Config keys:
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `range` | unset | Distance from the R10 to the tee, e.g. `"7ft"` or `"2.1m"`, sent to the device once it wakes. Unset leaves the device's own setting alone |
+| `aim_offset_deg` | unset | **Beta.** Degrees, -10 to 10: corrects a unit that is not aimed exactly at the target. The R10 measures horizontal angles from its own centerline; the offset is **added** to the launch direction, and to the face angle and path when the device tracked the club (a club it did not track reports 0 for face, path and attack, and those zeros are left as they are). Positive turns shots to the right. To set it, hit a short straight chip and enter the negative of the launch direction it shows (+ = right): a chip that reads 2.0° right takes `-2.0`. Spin and the attack angle are unchanged. Applied from the next shot, no restart; the decoder's `proto` types stay in the device's frame |
 
 ```sh
 # Find a paired R10, serve FRP on port 5880
@@ -239,6 +240,9 @@ cargo run --features frp --bin tenover-frp
 
 # Another port, with a tee distance
 cargo run --features frp --bin tenover-frp -- --target 0.0.0.0:9000 --set range=7ft
+
+# Aim correction for a chip that read 1.5° right
+cargo run --features frp --bin tenover-frp -- --set aim_offset_deg=-1.5
 
 # Dial flighthook
 cargo run --features frp --bin tenover-frp -- --target ws://flighthook:5880/frp
