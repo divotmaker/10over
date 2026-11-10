@@ -351,8 +351,10 @@ fn shot_sends_each_event_once_and_numbers_keep_counting() {
     assert_eq!(telemetry(&frp), [pair("ready", "false")]);
     let launch = &launches(&frp)[0];
     assert_eq!(launch.total_spin_rpm, Some(2800));
-    assert_eq!(launch.spin_axis, Some(5.0));
-    assert!(launch.backspin_rpm.is_some() && launch.sidespin_rpm.is_some());
+    // The wire's tilt of 5 is 5° left: the axis and sidespin are negative.
+    assert_eq!(launch.spin_axis, Some(-5.0));
+    assert!(launch.backspin_rpm.is_some());
+    assert!(launch.sidespin_rpm.expect("sidespin") < 0);
 
     // A retransmit of the same device shot is not a new shot.
     fake.send_envelope(&testing::shot_envelope(41, 2800.0, 5.0));

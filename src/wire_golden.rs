@@ -166,10 +166,11 @@ fn decode_shot_full() {
     assert!(close(b.launch_angle, 12.5));
     assert!(close(b.launch_direction, -1.2));
     assert!(close(b.ball_speed, 67.0));
-    assert!(close(b.spin_axis, 5.0));
+    // The wire's tilt of 5 is 5° left.
+    assert!(close(b.spin_axis, -5.0));
     assert!(close(b.total_spin, 2800.0));
     assert!((b.backspin - 2789.35).abs() < 0.1);
-    assert!((b.sidespin - 244.04).abs() < 0.1);
+    assert!((b.sidespin + 244.04).abs() < 0.1);
     assert_eq!(b.spin_calc_type, SpinCalcType::Estimated);
 
     let c = s.club.expect("club");
@@ -196,10 +197,11 @@ fn decode_shot_ball_measured() {
     assert!(close(b.launch_angle, 30.25));
     assert!(close(b.launch_direction, 2.5));
     assert!(close(b.ball_speed, 25.5));
-    assert!(close(b.spin_axis, -10.0));
+    // The wire's tilt of -10 is 10° right.
+    assert!(close(b.spin_axis, 10.0));
     assert!(close(b.total_spin, 6000.0));
     assert!((b.backspin - 5908.85).abs() < 0.1);
-    assert!((b.sidespin + 1041.89).abs() < 0.1);
+    assert!((b.sidespin - 1041.89).abs() < 0.1);
     assert_eq!(b.spin_calc_type, SpinCalcType::Measured);
 }
 
@@ -432,4 +434,17 @@ fn client_sends_builder_bytes() {
     assert_eq!(parsed.msg_type, gfdi::MSG_PROTOBUF_REQUEST);
     let (_hdr, pb) = gfdi::parse_frag_header(&parsed.payload).unwrap();
     assert_eq!(pb, ENVIRONMENT_TEE);
+}
+
+/// A draw (face closed to the path) arrives with a positive tilt on the wire,
+/// so the device's sign is + = left. Decoded, the axis and the sidespin are
+/// negative: tilted left, curving left, the same sense as the launch
+/// direction. A captured shot had face 3.9°, path 16.8° and tilt 22.2°.
+#[test]
+fn a_draw_decodes_tilted_left() {
+    let s = shot(&crate::testing::shot_envelope(5, 3000.0, 22.2));
+    let b = s.ball.expect("ball");
+    assert!(close(b.spin_axis, -22.2));
+    assert!(b.sidespin < 0.0);
+    assert!(b.backspin > 0.0);
 }

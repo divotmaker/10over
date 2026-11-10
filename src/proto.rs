@@ -67,7 +67,8 @@ pub struct BallData {
     pub launch_direction: f32,
     /// Initial ball velocity (m/s).
     pub ball_speed: f32,
-    /// Spin axis tilt (degrees).
+    /// Spin axis tilt (degrees), + = tilted right (the ball curves right).
+    /// The device reports the opposite sign; the decoder negates it.
     pub spin_axis: f32,
     /// Total spin rate (RPM).
     pub total_spin: f32,
@@ -354,13 +355,16 @@ fn decode_notification(notification: &alerts::Notification) -> EnvelopeEvent {
 
 fn decode_metrics(m: &monitor::ShotReadout) -> ShotData {
     let ball = m.ball.as_ref().map(|b| {
-        let axis_rad = b.spin_tilt_deg.unwrap_or(0.0).to_radians();
+        // The device's tilt is + for a ball curving left (a closed face to
+        // path tilts it +); negate it to + = right like the launch direction.
+        let axis = -b.spin_tilt_deg.unwrap_or(0.0);
+        let axis_rad = axis.to_radians();
         let total = b.spin_rpm.unwrap_or(0.0);
         BallData {
             launch_angle: b.vertical_angle_deg.unwrap_or(0.0),
             launch_direction: b.horizontal_angle_deg.unwrap_or(0.0),
             ball_speed: b.speed_mps.unwrap_or(0.0),
-            spin_axis: b.spin_tilt_deg.unwrap_or(0.0),
+            spin_axis: axis,
             total_spin: total,
             backspin: total * axis_rad.cos(),
             sidespin: total * axis_rad.sin(),
@@ -536,8 +540,8 @@ mod tests {
         assert!((ball.total_spin - 2800.0).abs() < 0.01);
         // back ≈ 2800 * cos(5°) ≈ 2789.4
         assert!((ball.backspin - 2789.4).abs() < 1.0);
-        // side ≈ 2800 * sin(5°) ≈ 244.0
-        assert!((ball.sidespin - 244.0).abs() < 1.0);
+        // Wire tilt +5° is 5° left: side ≈ 2800 * sin(-5°) ≈ -244.0
+        assert!((ball.sidespin + 244.0).abs() < 1.0);
 
         let club = shot.club.unwrap();
         assert!((club.club_head_speed - 44.0).abs() < 0.01);

@@ -583,7 +583,7 @@ message SwingTiming {
 | head_speed_mps | m/s | Club head speed. Same conversion |
 | vertical_angle_deg | degrees | Vertical launch angle |
 | horizontal_angle_deg | degrees | Horizontal launch angle |
-| spin_tilt_deg | degrees | Spin axis. Decompose: `backspin = spin_rpm * cos(spin_tilt)`, `sidespin = spin_rpm * sin(spin_tilt)` |
+| spin_tilt_deg | degrees | Spin axis, **+ = tilted left** (the ball curves left; a face closed to the path reads +). tenover negates it to + = right. Decompose after negating: `backspin = spin_rpm * cos(axis)`, `sidespin = spin_rpm * sin(axis)` |
 | spin_rpm | RPM | Total spin |
 | face_deg | degrees | Face angle at impact |
 | path_deg | degrees | Club path |
