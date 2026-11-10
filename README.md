@@ -88,10 +88,10 @@ at your option.
 
 ## Status
 
-**Alpha**. The protocol is reverse-engineered and still being mapped — the API
-will change as new message types are decoded and existing ones are refined.
-This crate follows [SemVer](https://semver.org/): until `1.0`, breaking changes
-bump the minor version.
+Verified against a **Garmin Approach R10** on Windows. Pre-1.0 (`0.x`): the
+protocol is reverse-engineered and still being mapped, so the API may change as
+new message types are decoded and existing ones are refined. This crate follows
+[SemVer](https://semver.org/): until `1.0`, breaking changes bump the minor version.
 
 ## Migrating from 0.4
 
