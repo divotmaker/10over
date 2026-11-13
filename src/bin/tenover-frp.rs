@@ -1,7 +1,7 @@
-//! tenover-frp: a Flight Relay Protocol device for the Garmin R10.
+//! tenover-frp: the Garmin R10 as a Flight Relay Protocol launch monitor.
 //!
-//! Finds a paired R10 over BLE, arms it, and serves its shots to FRP
-//! controllers, reconnecting whenever the device drops.
+//! Finds a paired R10 over BLE, arms it, and publishes its shots on an FRP
+//! bus as a launch monitor actor, reconnecting whenever the device drops.
 //!
 //! ```text
 //! tenover-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>]
@@ -9,7 +9,8 @@
 //! ```
 //!
 //! `--target` defaults to listening on `0.0.0.0:5880`; a `ws://` URL dials a
-//! controller such as flighthook instead. `--help` lists every config key.
+//! hub such as flighthook instead. The actor's id is kept in the config
+//! file's `[frp]` table. `--help` lists every config key.
 
 use std::process::ExitCode;
 

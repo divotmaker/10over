@@ -1,37 +1,39 @@
 //! The flightrelay [`DeviceDriver`] for the Garmin R10 (`driver` feature).
 //!
 //! [`R10`] finds a paired R10 over BLE, runs the handshake, arms the device
-//! and turns what it reports into FRP events. A host drives it:
-//! flightrelay's [`FrpServer`](https://docs.rs/flightrelay/0.5/flightrelay/struct.FrpServer.html)
-//! (the `tenover-frp` binary), or an application with its own loop.
+//! and turns what it reports into FRP messages. A host drives it:
+//! flightrelay's [`FrpServer`](https://docs.rs/flightrelay/0.6/flightrelay/struct.FrpServer.html)
+//! (the `tenover-frp` binary), or an application with its own loop. The host
+//! publishes the launch monitor actor's `bus.actor`, with the identity
+//! (manufacturer "Garmin", model "R10") and `source`
+//! ([`Source::Measured`]) in its `device` block.
 //!
 //! What a session emits:
 //!
-//! - after the handshake, `device_telemetry` with `ready=false`, `tilt=ok`
-//!   and `roll=ok`; the host adds the identity (manufacturer "Garmin", model
-//!   "R10") and `source` ([`Source::Measured`]);
-//! - when the device arms, `ready=true` and `device_state=waiting`; as it
-//!   records and processes a shot, `device_state=recording` and
-//!   `processing`;
-//! - per shot, all at once as the R10 reports it: `shot_trigger` (without a
-//!   timestamp: the R10 has no wall clock), `launch` (see
-//!   [`convert::launch`]), `club_path` when the device tracked the club,
-//!   `shot_finished`, then `ready=false`;
-//! - a device error as an alert, with its tilt as `tilt`/`roll` telemetry;
-//! - `raw_frame`s while the host wants them: one per GFDI message, labeled
-//!   `"<notify|write> <message type, hex>"`. Messages that carry the
+//! - after the handshake, the `not_armed` blocker;
+//! - when the device arms, no blockers and the telemetry key
+//!   `device_state=waiting`; as it records and processes a shot,
+//!   `device_state=recording` and `processing`;
+//! - per shot, all at once as the R10 reports it: `shot.trigger` (without a
+//!   timestamp: the R10 has no wall clock), `shot.launch` (see
+//!   [`convert::launch`]), `shot.club` when the device tracked the club,
+//!   `shot.finished`, then the `not_armed` blocker until it arms again;
+//! - a device error as a `bus.alert`; one that carries the device's tilt
+//!   sets the attitude (`tilt` is the pitch, `roll` the roll, in degrees);
+//! - `shot.raw` frames while the host turns them on: one per GFDI message,
+//!   labeled `"<notify|write> <message type, hex>"`. Messages that carry the
 //!   device's identity or keys, messages that cannot be classified, and
 //!   everything before the handshake finished (the MultiLink registration
 //!   included) are never sent; they reach only the host's log, as trace
-//!   lines with the hex. While the host neither wants raw frames nor shows
+//!   lines with the hex. While raw frames are off and the host shows no
 //!   trace lines, messages are not decoded for capture at all.
 //!
-//! The R10 has no detection mode, hand or club setting, so commands are
-//! ignored. The configured tee distance ([`Config::range`]) is sent once the
-//! device wakes; changing it takes a new session. The aim offset
-//! ([`Config::aim_offset_deg`], **beta**) corrects the horizontal angles of
-//! the FRP output ([`convert`]); a change reaches the running session and
-//! applies from the next shot.
+//! The R10 has no detection mode, hand or club setting, so the hints of
+//! `golfer.turn` are ignored. The configured tee distance
+//! ([`Config::range`]) is sent once the device wakes; changing it takes a
+//! new session. The aim offset ([`Config::aim_offset_deg`], **beta**)
+//! corrects the horizontal angles of the FRP output ([`convert`]); a change
+//! reaches the running session and applies from the next shot.
 //!
 //! The handshake must finish within 10 s of its start, however much the
 //! device sends meanwhile. Closing or dropping a session on Windows and
@@ -50,7 +52,7 @@ use flightrelay::driver::{
     Backoff, ConfigError, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverConfig,
     DriverInfo, Events, Level, Live, NoAction, RawProfile, SessionEnd, ShotIds, Stop, Stopped,
 };
-use flightrelay::{FrpEvent, RawFrame, Severity, Source};
+use flightrelay::{FrpBody, RawFrame, Severity, Source};
 
 use crate::ble::{BleError, BleTransport};
 use crate::client::{Client, Event, Transport};
@@ -171,8 +173,7 @@ impl R10 {
             match result {
                 Ok(Some(Event::HandshakeComplete)) => {
                     ctx.out.log(Level::Info, "handshake complete");
-                    ctx.out
-                        .telemetry([("ready", "false"), ("tilt", "ok"), ("roll", "ok")]);
+                    ctx.out.ready(false);
                     return Ok(session);
                 }
                 Ok(Some(event)) => {
@@ -406,7 +407,7 @@ impl<T: Transport> R10Session<T> {
         &self.identity
     }
 
-    /// [`DeviceSession::close`]: report `ready=false` and release the
+    /// [`DeviceSession::close`]: raise the `not_armed` blocker and release the
     /// device. Over BLE that disconnects on btleplug (bounded at 4 s) and
     /// drops the connection on BlueZ.
     ///
@@ -419,8 +420,8 @@ impl<T: Transport> R10Session<T> {
         Ok(())
     }
 
-    /// Emit the messages captured since the last call: as `raw_frame`s when
-    /// the host wants them and they may leave, else as audit lines.
+    /// Emit the messages captured since the last call: as `shot.raw` frames
+    /// when raw frames are on and they may leave, else as audit lines.
     fn flush_raw(&mut self, out: &mut Events<'_>, connected: bool) {
         for c in self.client.transport_mut().drain() {
             if !connected || c.private {
@@ -431,7 +432,7 @@ impl<T: Transport> R10Session<T> {
                     label: Some(c.label),
                     ..RawFrame::new(c.dir, 0, c.data)
                 };
-                out.frp(FrpEvent::raw_frame(frame));
+                out.frp(FrpBody::ShotRaw(frame));
             }
         }
     }
@@ -451,12 +452,10 @@ impl<T: Transport> R10Session<T> {
             }
             Event::Ready => {
                 out.log(Level::Info, "armed, waiting for shots");
-                out.telemetry([
-                    ("ready", "true"),
-                    ("device_state", "waiting"),
-                    ("tilt", "ok"),
-                    ("roll", "ok"),
-                ]);
+                // A level reading from an earlier error no longer holds.
+                out.attitude(None, None);
+                out.ready(true);
+                out.telemetry([("device_state", "waiting")]);
             }
             Event::Shot(shot) => {
                 let key = self.ids.next_key();
@@ -470,9 +469,10 @@ impl<T: Transport> R10Session<T> {
                     out.launch(key.clone(), convert::launch(ball, aim));
                 }
                 if let Some(club) = &shot.club {
-                    out.club_path(key.clone(), convert::club_data(club, aim));
+                    out.club(key.clone(), convert::club_data(club, aim));
                 }
                 out.shot_finished(key);
+                out.attitude(None, None);
                 out.ready(false);
             }
             Event::StateChange(state) => {
@@ -497,10 +497,10 @@ impl<T: Transport> R10Session<T> {
                 let mut message = format!("R10: {:?}", err.code);
                 if let Some((roll, pitch)) = err.tilt {
                     let _ = write!(message, " (roll={roll:.1}, pitch={pitch:.1})");
-                    out.telemetry([
-                        ("tilt", format!("{pitch:.1}")),
-                        ("roll", format!("{roll:.1}")),
-                    ]);
+                    out.attitude(degrees(pitch), degrees(roll));
+                } else {
+                    // An error without a reading takes the last one off.
+                    out.attitude(None, None);
                 }
                 out.log(Level::Warn, message.clone());
                 out.alert(severity, message);
@@ -551,6 +551,12 @@ impl DeviceSession for R10Session {
     fn close(self, out: &mut Events<'_>) -> Result<(), Error> {
         R10Session::close(self, out)
     }
+}
+
+/// An angle from the device as `f64`, with the decimal value the `f32`
+/// prints as (4.3, not 4.300000190734863).
+fn degrees(angle: f32) -> f64 {
+    angle.to_string().parse().unwrap_or(f64::from(angle))
 }
 
 #[cfg(test)]

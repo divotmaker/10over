@@ -22,8 +22,9 @@ poll-based API:
   by default). Auto-selects BlueZ on Linux or btleplug on Windows/macOS.
 - **`driver::R10`** — a [flightrelay](https://github.com/flightrelay/sdk-rust)
   `DeviceDriver` for the R10 (`driver` feature): connect, handshake, arm, and
-  shots as [Flight Relay Protocol](https://github.com/flightrelay/spec) events.
-  The `tenover-frp` binary (`frp` feature) serves it to FRP controllers.
+  shots as [Flight Relay Protocol](https://github.com/flightrelay/spec)
+  messages from a launch monitor actor. The `tenover-frp` binary (`frp`
+  feature) puts it on an FRP bus.
 
 ## Legal Basis — DMCA Section 1201(f)
 
@@ -92,6 +93,23 @@ Verified against a **Garmin Approach R10** on Windows. Pre-1.0 (`0.x`): the
 protocol is reverse-engineered and still being mapped, so the API may change as
 new message types are decoded and existing ones are refined. This crate follows
 [SemVer](https://semver.org/): until `1.0`, breaking changes bump the minor version.
+
+## Migrating from 0.5
+
+0.6 moves to flightrelay 0.6 (FRP 0.3.0), the actor bus. A 0.6 driver and a
+FRP 0.2.0 endpoint do not interoperate, so the other side moves to FRP 0.3.0
+too. The device's behavior is unchanged: same arming, same settings, same
+shots.
+
+| | 0.5 | 0.6 |
+|---|---|---|
+| Shot messages | `shot_trigger`, `launch`, `club_path`, `shot_finished`, `raw_frame`, `alert` | `shot.trigger`, `shot.launch`, `shot.club`, `shot.finished`, `shot.raw`, `bus.alert` |
+| Readiness | `device_telemetry` `ready` | `blockers` of the actor's `bus.actor`: `not_armed` until the device arms and from each shot until it arms again |
+| Identity and status | `device_telemetry` | the `device` block of `bus.actor` (manufacturer, model, `source`, `tilt`/`roll`); `device_state` stays a telemetry key |
+| Tilt | `tilt`/`roll` telemetry, `ok` or the angles | `tilt` (pitch) and `roll` in degrees, set by a leveling error, no value before one; the reading leaves the actor when the device arms again, takes a shot, or reports an error without one |
+| Player context | `set_detection_mode` (ignored) | the hints of `golfer.turn` (ignored) |
+| Raw frames | on when a controller asks | on with `--set frp.raw_frames=true` (the `[frp]` table of the config file) |
+| `tenover-frp` identity | the device | an actor id, generated on the first run and saved in the config file's `[frp]` table |
 
 ## Migrating from 0.4
 
@@ -210,9 +228,10 @@ cargo build --example r10 --target x86_64-pc-windows-gnu --release
 
 The `driver` feature adds `driver::R10`, a flightrelay `DeviceDriver` that
 makes the R10 a standard [Flight Relay Protocol](https://github.com/flightrelay/spec)
-(FRP 0.2.0) device. Any FRP controller (flighthook, dashboards, etc.) receives
-shot data without knowing anything about the R10 protocol. The `frp` feature
-builds `tenover-frp`, which serves the driver over WebSocket:
+(FRP 0.3.0) launch monitor actor. Every other actor on the bus (flighthook,
+games, dashboards, etc.) receives shot data without knowing anything about the
+R10 protocol. The `frp` feature builds `tenover-frp`, which runs the driver on
+an FRP bus over WebSocket:
 
 ```text
 tenover-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>]
@@ -221,9 +240,9 @@ tenover-frp [--config <path>] [--target <listen-addr | ws://host:port/frp>]
 
 | Flag | Meaning |
 |------|---------|
-| `--target` | An address to listen on (default `0.0.0.0:5880`; several controllers may connect), or a `ws://` URL to dial a controller such as flighthook |
-| `--config` | A TOML file with the config keys at the top level |
-| `--set key=value` | Set one config key, after the file; repeatable |
+| `--target` | An address to listen on (default `0.0.0.0:5880`; several peers may connect), or a `ws://` URL to dial a hub such as flighthook |
+| `--config` | A TOML file with the config keys at the top level and the runner's `[frp]` table |
+| `--set key=value` | Set one config key, after the file; repeatable; `frp.<key>` sets a runner key |
 | `--log` | The lowest level of log lines printed to stderr (default `info`) |
 | `--help` | Usage and every config key |
 
@@ -233,6 +252,10 @@ Config keys:
 |-----|---------|---------|
 | `range` | unset | Distance from the R10 to the tee, e.g. `"7ft"` or `"2.1m"`, sent to the device once it wakes. Unset leaves the device's own setting alone |
 | `aim_offset_deg` | unset | **Beta.** Degrees, -10 to 10: corrects a unit that is not aimed exactly at the target. The R10 measures horizontal angles from its own centerline; the offset is **added** to the launch direction, and to the face angle and path when the device tracked the club (a club it did not track reports 0 for face, path and attack, and those zeros are left as they are). Positive turns shots to the right. To set it, hit a short straight chip and enter the negative of the launch direction it shows (+ = right): a chip that reads 2.0° right takes `-2.0`. Spin and the attack angle are unchanged. Applied from the next shot, no restart; the decoder's `proto` types stay in the device's frame |
+
+The `[frp]` table holds `actor_id`, the actor's id on the bus (generated on
+the first run and written into the `--config` file, so it survives restarts;
+without `--config` it lasts for the run), and `raw_frames` (default `false`).
 
 ```sh
 # Find a paired R10, serve FRP on port 5880
@@ -253,24 +276,26 @@ range), with a backoff that grows by 1 s per failed attempt up to 15 s and
 starts over after a session of 10 s or more. Ctrl-C stops it cleanly, even
 during a BLE scan.
 
-What the device sends over FRP:
+What the actor publishes over FRP:
 
-- `device_telemetry` with `source: "measured"`, manufacturer `Garmin` and
-  model `R10` before the first shot; `ready`, `device_state` (`waiting`,
-  `recording`, `processing`), and `tilt`/`roll` (`ok`, or the angles the
-  device reports with a leveling error);
-- per shot: `shot_trigger`, `launch` (launch speed, both launch angles, and
-  total spin, spin axis, backspin and sidespin, all measured; a total spin of
-  0 is sent as 0 with no axis), `club_path` (club speed, face, path, attack
-  angle) and `shot_finished`. The R10 reports no flight result;
-- device errors as alerts;
-- `raw_frame`s, only to a controller that asks: one per GFDI message, labeled
-  `notify <type>` or `write <type>` (the message type in hex). Messages that
-  carry the device's identity or keys, and everything before the handshake
-  finished, are never sent.
+- `bus.actor` with the role `launch_monitor` and a `device` block with
+  `source: "measured"`, manufacturer `Garmin` and model `R10`; `blockers`
+  holds `not_armed` until the device arms and again from each shot until it
+  arms again; the telemetry key `device_state` (`waiting`, `recording`,
+  `processing`); and `tilt`/`roll`, the angles the device reports with a
+  leveling error;
+- per shot: `shot.trigger`, `shot.launch` (launch speed, both launch angles,
+  and total spin, spin axis, backspin and sidespin, all measured; a total
+  spin of 0 is sent as 0 with no axis), `shot.club` (club speed, face, path,
+  attack angle) and `shot.finished`. The R10 reports no flight result;
+- device errors as `bus.alert`;
+- `shot.raw` frames, only with `frp.raw_frames = true`: one per GFDI message,
+  labeled `notify <type>` or `write <type>` (the message type in hex).
+  Messages that carry the device's identity or keys, and everything before
+  the handshake finished, are never sent.
 
-The R10 has no detection mode, hand or club setting, so a controller's
-`set_detection_mode` is ignored.
+The R10 has no detection mode, hand or club setting, so the hints of
+`golfer.turn` are ignored.
 
 Pre-built binaries for Linux and Windows are attached to each
 [GitHub release](https://github.com/divotmaker/10over/releases).
