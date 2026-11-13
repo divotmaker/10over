@@ -21,7 +21,7 @@ poll-based API:
 - **`BleTransport`** — platform-agnostic BLE transport (`ble` feature, enabled
   by default). Auto-selects BlueZ on Linux or btleplug on Windows/macOS.
 - **`driver::R10`** — a [flightrelay](https://github.com/flightrelay/sdk-rust)
-  `DeviceDriver` for the R10 (`driver` feature): connect, handshake, arm, and
+  `FrpDriver` for the R10 (`driver` feature): connect, handshake, arm, and
   shots as [Flight Relay Protocol](https://github.com/flightrelay/spec)
   messages from a launch monitor actor. The `tenover-frp` binary (`frp`
   feature) puts it on an FRP bus.
@@ -94,6 +94,18 @@ protocol is reverse-engineered and still being mapped, so the API may change as
 new message types are decoded and existing ones are refined. This crate follows
 [SemVer](https://semver.org/): until `1.0`, breaking changes bump the minor version.
 
+## Migrating from 0.6
+
+0.7 moves to flightrelay 0.7, where time is an input to a driver. The wire
+protocol (FRP 0.3.0) and the device's behavior are unchanged.
+
+| | 0.6 | 0.7 |
+|---|---|---|
+| Session entry point | `R10Session::poll(timeout, out)`, which reads and sleeps until `timeout` | `R10Session::step(now, out) -> Activity`, one pass at `now`: `Activity::Active` after an event, `Activity::Idle` when the device is quiet. `FrpSession::poll` is flightrelay's loop over `step` |
+| Handshake timing | 10 s on the wall clock | 10 s of the host's time (`ConnectCtx::now`); every pass ticks the host, and a quiet pass waits through `ConnectCtx::wait` |
+| Shot deduplication | `Client::poll` | adds `Client::poll_at(now)`; `poll` is `poll_at(Instant::now())` |
+| A session from `R10::connect_with` (`testing`) | stepped with `poll(timeout, out)` in real time | stepped with `step(now, out)`, e.g. through flightrelay's `testing::TestHost` in virtual time |
+
 ## Migrating from 0.5
 
 0.6 moves to flightrelay 0.6 (FRP 0.3.0), the actor bus. A 0.6 driver and a
@@ -118,7 +130,7 @@ cannot handshake, so controllers move to FRP 0.2.0 too.
 
 | | 0.4 | 0.5 |
 |---|---|---|
-| FRP device API | `FrpDevice`, `ControllerCommand`, the `frp` module | `driver::R10` (a flightrelay `DeviceDriver`) |
+| FRP device API | `FrpDevice`, `ControllerCommand`, the `frp` module | `driver::R10` (a flightrelay `FrpDriver`) |
 | Shot conversions | `frp::{ball_flight, club_data}` | `driver::convert::{launch, club_data}`; shots carry `launch` |
 | `tenover-frp` target | `tenover-frp <target>` | `tenover-frp --target <target>`, named flags only (see [FRP device](#frp-device-tenover-frp)); several controllers at once |
 | `tenover-frp` model | `Approach R10` | `R10` |
@@ -226,7 +238,7 @@ cargo build --example r10 --target x86_64-pc-windows-gnu --release
 
 ### FRP device (`tenover-frp`)
 
-The `driver` feature adds `driver::R10`, a flightrelay `DeviceDriver` that
+The `driver` feature adds `driver::R10`, a flightrelay `FrpDriver` that
 makes the R10 a standard [Flight Relay Protocol](https://github.com/flightrelay/spec)
 (FRP 0.3.0) launch monitor actor. Every other actor on the bus (flighthook,
 games, dashboards, etc.) receives shot data without knowing anything about the
@@ -306,7 +318,7 @@ Pre-built binaries for Linux and Windows are attached to each
 |---------|---------|-------------|
 | `ble` | Yes | Platform-agnostic BLE transport (BlueZ on Linux, btleplug on Windows/macOS) |
 | `config` | No | The driver's settings (`config::Config`), with no BLE stack: builds for `wasm32-unknown-unknown` |
-| `driver` | No | The flightrelay `DeviceDriver` for the R10 (`driver::R10`); implies `config` and `ble` |
+| `driver` | No | The flightrelay `FrpDriver` for the R10 (`driver::R10`); implies `config` and `ble` |
 | `frp` | No | The `tenover-frp` binary; implies `driver` |
 | `serde` | No | Serialize/deserialize shot data types |
 | `testing` | No | Frame builders with synthetic device identity, for downstream tests (`tenover::testing`) |

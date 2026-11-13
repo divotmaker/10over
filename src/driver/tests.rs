@@ -3,7 +3,8 @@ use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
 
-use flightrelay::driver::{ConnectHost, DeviceEvent, HostFlags, StatusChange, TurnHints};
+use flightrelay::driver::{DeviceEvent, StatusChange};
+use flightrelay::testing::TestHost;
 use flightrelay::units::Distance;
 use flightrelay::{BusAlert, Launch, RawDir, ShotTrigger};
 
@@ -23,7 +24,7 @@ struct Wire {
     tx: Vec<Vec<u8>>,
     /// Fail the next read with this error kind.
     fail: Option<io::ErrorKind>,
-    /// Once `rx` is empty, read this chunk forever, 1 ms apart.
+    /// Once `rx` is empty, read this chunk forever.
     chatter: Option<Vec<u8>>,
     /// Times the session released the device.
     released: u32,
@@ -70,9 +71,6 @@ impl Transport for Fake {
         let Some(c) = w.rx.pop_front().or_else(|| w.chatter.clone()) else {
             return Err(io::ErrorKind::WouldBlock.into());
         };
-        if w.rx.is_empty() && w.chatter.is_some() {
-            std::thread::sleep(Duration::from_millis(1));
-        }
         buf[..c.len()].copy_from_slice(&c);
         Ok(c.len())
     }
@@ -87,28 +85,6 @@ impl Transport for Fake {
     }
 }
 
-/// A host that ticks without inputs and stops after `stop_after` ticks.
-struct Host {
-    hints: TurnHints,
-    ticks: u32,
-    stop_after: Option<(u32, Stop)>,
-}
-
-impl ConnectHost for Host {
-    fn tick(&mut self) {
-        self.ticks += 1;
-        if let Some((n, stop)) = &self.stop_after
-            && self.ticks >= *n
-        {
-            stop.stop();
-        }
-    }
-
-    fn hints(&self) -> &TurnHints {
-        &self.hints
-    }
-}
-
 /// What reaches the bus: a message body, or a change to the actor's status.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // a test's handful of values
@@ -117,33 +93,28 @@ enum Out {
     Change(StatusChange),
 }
 
-/// The host side of a test: flags and every event the driver emitted.
+/// The host side of a test: a [`TestHost`] (flags, stepped clock, sink) and
+/// the events taken from it that no assertion has consumed yet.
 struct Rig {
-    flags: HostFlags,
+    host: TestHost,
     events: Vec<DeviceEvent>,
 }
 
 impl Rig {
     fn new(wants_raw: bool) -> Self {
-        let flags = HostFlags::new();
-        flags.set_wants_raw(wants_raw);
+        Self::on(TestHost::new(), wants_raw)
+    }
+
+    fn on(host: TestHost, wants_raw: bool) -> Self {
+        host.flags.set_wants_raw(wants_raw);
         Self {
-            flags,
+            host,
             events: Vec::new(),
         }
     }
 
     fn connect(&mut self, driver: &mut R10, fake: &Fake) -> Result<R10Session<Fake>, Error> {
-        self.connect_until(driver, fake, None)
-    }
-
-    fn connect_until(
-        &mut self,
-        driver: &mut R10,
-        fake: &Fake,
-        stop_after: Option<u32>,
-    ) -> Result<R10Session<Fake>, Error> {
-        self.establish(driver, fake, stop_after, keep)
+        self.establish(driver, fake, keep)
     }
 
     /// The handshake as `connect` runs it, with `release` freeing the
@@ -152,32 +123,27 @@ impl Rig {
         &mut self,
         driver: &mut R10,
         fake: &Fake,
-        stop_after: Option<u32>,
         release: fn(&mut Fake),
     ) -> Result<R10Session<Fake>, Error> {
-        let stop = Stop::new();
-        let mut host = Host {
-            hints: TurnHints::default(),
-            ticks: 0,
-            stop_after: stop_after.map(|n| (n, stop.clone())),
-        };
-        let events = &mut self.events;
-        let mut sink = |e: DeviceEvent| events.push(e);
-        let mut ctx = ConnectCtx::new(&stop, Events::new(&mut sink, &self.flags), &mut host);
-        driver.establish(&mut ctx, fake.clone(), ADDRESS, TEST_MTU, release)
+        self.host
+            .connect_with(|ctx| driver.establish(ctx, fake.clone(), ADDRESS, TEST_MTU, release))
     }
 
+    /// Step the session through 30 ms of the host's time: what the fake
+    /// device has queued is read and handled.
     fn poll(&mut self, session: &mut R10Session<Fake>) -> Result<(), Error> {
-        let events = &mut self.events;
-        let mut sink = |e: DeviceEvent| events.push(e);
-        session.poll(
-            Duration::from_millis(30),
-            &mut Events::new(&mut sink, &self.flags),
-        )
+        self.host
+            .run_for(Duration::from_millis(30), |now, out| session.step(now, out))
+    }
+
+    /// Close the session.
+    fn close(&mut self, session: R10Session<Fake>) -> Result<(), Error> {
+        self.host.with(|_, out| session.close(out))
     }
 
     /// Take the messages and status changes seen so far.
     fn frp(&mut self) -> Vec<Out> {
+        self.events.extend(self.host.take());
         self.events
             .drain(..)
             .filter_map(|e| match e {
@@ -188,7 +154,9 @@ impl Rig {
             .collect()
     }
 
-    fn logs(&self, level: Level) -> Vec<String> {
+    /// The log lines at `level` seen so far.
+    fn logs(&mut self, level: Level) -> Vec<String> {
+        self.events.extend(self.host.take());
         self.events
             .iter()
             .filter_map(|e| match e {
@@ -312,7 +280,6 @@ fn info_names_a_measured_exclusive_garmin() {
     assert_eq!(info.manufacturer, Some("Garmin"));
     assert!(info.exclusive);
     assert_eq!(info.raw.as_ref().map(|r| r.transport), Some("r10-ble"));
-    assert_eq!(R10::STOP_WAIT, Duration::from_secs(6));
 }
 
 #[test]
@@ -735,16 +702,14 @@ fn a_transport_error_ends_the_session() {
     );
 
     let mut backoff = Backoff::default();
-    let events = &mut rig.events;
-    let mut sink = |e: DeviceEvent| events.push(e);
-    let mut out = Events::new(&mut sink, &rig.flags);
     let ended = SessionEnd {
         error: Some(&err),
         connected_for: Some(Duration::from_secs(1)),
         attempts: 0,
     };
     assert_eq!(
-        d.retry_delay(&ended, &mut backoff, &mut out),
+        rig.host
+            .with(|_, out| d.retry_delay(&ended, &mut backoff, out)),
         Some(Duration::from_secs(1))
     );
     let frp = rig.frp();
@@ -759,12 +724,10 @@ fn a_transport_error_ends_the_session() {
 fn a_stop_ends_the_handshake() {
     // The device never answers; the host stops on its second tick.
     let fake = Fake::default();
-    let mut rig = Rig::new(false);
+    let mut rig = Rig::on(TestHost::new().stop_after_ticks(2), false);
     let mut d = driver(None);
-    let started = Instant::now();
-    let err = rig.connect_until(&mut d, &fake, Some(2)).unwrap_err();
+    let err = rig.connect(&mut d, &fake).unwrap_err();
     assert!(matches!(err, Error::Stopped), "{err}");
-    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]
@@ -774,11 +737,7 @@ fn close_reports_not_ready() {
     let mut d = driver(None);
     let session = armed(&mut rig, &mut d, &fake);
     rig.frp();
-    let events = &mut rig.events;
-    let mut sink = |e: DeviceEvent| events.push(e);
-    session
-        .close(&mut Events::new(&mut sink, &rig.flags))
-        .expect("close");
+    rig.close(session).expect("close");
     assert_eq!(status(&rig.frp()), [pair("blockers", "not_armed")]);
 }
 
@@ -789,14 +748,10 @@ fn close_releases_the_device() {
     let mut rig = Rig::new(false);
     let mut d = driver(None);
     let session = rig
-        .establish(&mut d, &fake, None, Fake::release)
+        .establish(&mut d, &fake, Fake::release)
         .expect("handshake");
     assert_eq!(fake.0.borrow().released, 0);
-    let events = &mut rig.events;
-    let mut sink = |e: DeviceEvent| events.push(e);
-    session
-        .close(&mut Events::new(&mut sink, &rig.flags))
-        .expect("close");
+    rig.close(session).expect("close");
     assert_eq!(fake.0.borrow().released, 1);
 }
 
@@ -812,34 +767,43 @@ fn a_stop_as_the_connect_succeeds_releases_the_transport() {
     assert_eq!(kept.0.borrow().released, 1);
 }
 
+/// A fake that registers, then answers every read with a NAK: no poll is
+/// ever empty.
+fn chattering() -> Fake {
+    let fake = Fake::default();
+    let mut w = fake.0.borrow_mut();
+    w.rx.push_back(testing::register_response(HANDLE));
+    let nak = testing::ack_frame(MSG_CONFIGURATION, 1, &[]);
+    let chunks = testing::chunks(HANDLE, &nak, 20);
+    assert_eq!(chunks.len(), 1, "one NAK per read");
+    w.chatter = chunks.into_iter().next();
+    drop(w);
+    fake
+}
+
 #[test]
 fn the_handshake_is_bounded_while_the_device_keeps_talking() {
-    // Registered, then a NAK on every read: no poll is ever empty.
-    let fake = Fake::default();
-    {
-        let mut w = fake.0.borrow_mut();
-        w.rx.push_back(testing::register_response(HANDLE));
-        let nak = testing::ack_frame(MSG_CONFIGURATION, 1, &[]);
-        let chunks = testing::chunks(HANDLE, &nak, 20);
-        assert_eq!(chunks.len(), 1, "one NAK per read");
-        w.chatter = chunks.into_iter().next();
-    }
-    let mut rig = Rig::new(false);
-    rig.flags.set_min_level(Level::Info);
+    // Each pass ticks, and each tick takes 1 ms of the host's time.
+    let mut rig = Rig::on(TestHost::new().tick_takes(Duration::from_millis(1)), false);
+    rig.host.flags.set_min_level(Level::Info);
+    let started = rig.host.now();
     let mut d = driver(None);
-    d.handshake_timeout = Duration::from_millis(300);
-    let started = Instant::now();
-    // The host's stop after 30 ticks (3 s) only guards against a hang.
-    let err = rig.connect_until(&mut d, &fake, Some(30)).unwrap_err();
+    let err = rig.connect(&mut d, &chattering()).unwrap_err();
     assert!(
         matches!(err, Error::Protocol(crate::Error::HandshakeTimeout)),
         "{err}"
     );
-    let took = started.elapsed();
-    assert!(
-        took >= Duration::from_millis(300) && took < Duration::from_secs(2),
-        "{took:?}"
-    );
+    assert_eq!(rig.host.now() - started, HANDSHAKE_TIMEOUT);
+}
+
+#[test]
+fn a_stop_ends_the_handshake_while_the_device_keeps_talking() {
+    let mut rig = Rig::on(TestHost::new().stop_after_ticks(5), false);
+    rig.host.flags.set_min_level(Level::Info);
+    let mut d = driver(None);
+    let err = rig.connect(&mut d, &chattering()).unwrap_err();
+    assert!(matches!(err, Error::Stopped), "{err}");
+    assert_eq!(rig.host.ticks(), 5);
 }
 
 #[test]
@@ -873,14 +837,14 @@ fn debug_output_leaves_out_the_address() {
 fn messages_are_captured_only_while_someone_can_receive_them() {
     let fake = Fake::default();
     let mut rig = Rig::new(false);
-    rig.flags.set_min_level(Level::Debug);
+    rig.host.flags.set_min_level(Level::Debug);
     let mut d = driver(None);
     let mut session = armed(&mut rig, &mut d, &fake);
     assert!(!session.client.transport().enabled());
     assert!(rig.logs(Level::Trace).is_empty());
 
     // Raw frames wanted: capture starts with the next poll.
-    rig.flags.set_wants_raw(true);
+    rig.host.flags.set_wants_raw(true);
     fake.send_envelope(&testing::shot_envelope(9, 3000.0, 2.0));
     rig.poll(&mut session).expect("poll");
     assert!(session.client.transport().enabled());

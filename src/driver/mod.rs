@@ -1,9 +1,10 @@
-//! The flightrelay [`DeviceDriver`] for the Garmin R10 (`driver` feature).
+//! The flightrelay [`FrpDriver`] for the Garmin R10 (`driver` feature).
 //!
 //! [`R10`] finds a paired R10 over BLE, runs the handshake, arms the device
 //! and turns what it reports into FRP messages. A host drives it:
-//! flightrelay's [`FrpServer`](https://docs.rs/flightrelay/0.6/flightrelay/struct.FrpServer.html)
-//! (the `tenover-frp` binary), or an application with its own loop. The host
+//! flightrelay's [`FrpServer`](https://docs.rs/flightrelay/0.7/flightrelay/struct.FrpServer.html)
+//! (the `tenover-frp` binary), or an application with its own loop that
+//! calls [`FrpSession::step`] with the time now, or `poll`. The host
 //! publishes the launch monitor actor's `bus.actor`, with the identity
 //! (manufacturer "Garmin", model "R10") and `source`
 //! ([`Source::Measured`]) in its `device` block.
@@ -49,8 +50,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use flightrelay::driver::{
-    Backoff, ConfigError, ConnectCtx, DeviceDriver, DeviceIdentity, DeviceSession, DriverConfig,
-    DriverInfo, Events, Level, Live, NoAction, RawProfile, SessionEnd, ShotIds, Stop, Stopped,
+    Activity, Backoff, ConfigError, ConnectCtx, DeviceIdentity, DriverConfig, DriverInfo, Events,
+    FrpDriver, FrpSession, IDLE, Level, Live, NoAction, RawProfile, SessionEnd, ShotIds, Stop,
+    Stopped,
 };
 use flightrelay::{FrpBody, RawFrame, Severity, Source};
 
@@ -63,11 +65,9 @@ use raw::Tap;
 
 /// Longest wait from the start of the handshake to its end.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// How often a connect calls `ctx.tick()` while it waits.
+/// How often the BLE scan calls `ctx.tick()` while it waits.
 const TICK: Duration = Duration::from_millis(100);
-/// Sleep between reads while the device is quiet.
-const IDLE_SLEEP: Duration = Duration::from_millis(5);
-/// Empty polls in a row before a read loop sleeps.
+/// Empty polls in a row before a read loop waits ([`IDLE`]).
 const IDLE_POLLS: u32 = 3;
 /// The MTU a session over a test transport uses.
 #[cfg(any(test, feature = "testing"))]
@@ -104,12 +104,10 @@ pub struct R10 {
     ids: ShotIds,
     /// [`Config::aim_offset`], shared with the sessions.
     aim_offset: Live<f64>,
-    /// [`HANDSHAKE_TIMEOUT`]; tests shorten it.
-    handshake_timeout: Duration,
 }
 
 impl R10 {
-    /// Run the handshake over `transport`, as [`connect`](DeviceDriver::connect)
+    /// Run the handshake over `transport`, as [`connect`](FrpDriver::connect)
     /// does once BLE is up, with `address` as the device id. For tests: a
     /// fake [`Transport`] fed with [`testing`](crate::testing) frames.
     ///
@@ -128,8 +126,10 @@ impl R10 {
     }
 
     /// Start the client on `transport` and run it until the handshake is
-    /// complete, for at most the handshake timeout from now. `release`
-    /// frees the device when the session closes.
+    /// complete, for at most [`HANDSHAKE_TIMEOUT`] of the host's time from
+    /// now. Every pass ticks, so a stop is seen while the device keeps
+    /// talking; after [`IDLE_POLLS`] empty polls a pass waits [`IDLE`].
+    /// `release` frees the device when the session closes.
     fn establish<T: Transport>(
         &mut self,
         ctx: &mut ConnectCtx<'_>,
@@ -138,7 +138,7 @@ impl R10 {
         mtu: usize,
         release: fn(&mut T),
     ) -> Result<R10Session<T>, Error> {
-        let deadline = Instant::now() + self.handshake_timeout;
+        let deadline = ctx.now() + HANDSHAKE_TIMEOUT;
         ctx.out.phase("handshaking");
         let identity = DeviceIdentity::new(address)
             .with_manufacturer("Garmin")
@@ -153,14 +153,11 @@ impl R10 {
             release,
         };
         session.client.start()?;
-        let mut ticked = Instant::now();
         let mut idle = 0;
         loop {
-            if ticked.elapsed() >= TICK {
-                ctx.tick()?;
-                ticked = Instant::now();
-            }
-            if Instant::now() >= deadline {
+            ctx.tick()?;
+            let now = ctx.now();
+            if now >= deadline {
                 return Err(crate::Error::HandshakeTimeout.into());
             }
             // Before the handshake every message is audit-only.
@@ -168,7 +165,7 @@ impl R10 {
                 .client
                 .transport_mut()
                 .set_enabled(ctx.out.enabled(Level::Trace));
-            let result = session.client.poll();
+            let result = session.client.poll_at(now);
             session.flush_raw(&mut ctx.out, false);
             match result {
                 Ok(Some(Event::HandshakeComplete)) => {
@@ -183,7 +180,7 @@ impl R10 {
                 Ok(None) => {
                     idle += 1;
                     if idle >= IDLE_POLLS {
-                        thread::sleep(IDLE_SLEEP);
+                        ctx.wait(IDLE)?;
                     }
                 }
                 Err(e @ crate::Error::Transport(_)) => return Err(e.into()),
@@ -193,7 +190,7 @@ impl R10 {
     }
 }
 
-impl DeviceDriver for R10 {
+impl FrpDriver for R10 {
     type Config = Config;
     type Error = Error;
     type Action = NoAction;
@@ -217,7 +214,6 @@ impl DeviceDriver for R10 {
             aim_offset: Live::new(config.aim_offset()),
             config,
             ids: ShotIds::new(),
-            handshake_timeout: HANDSHAKE_TIMEOUT,
         })
     }
 
@@ -335,7 +331,7 @@ fn protocol_error(e: &crate::Error, out: &mut Events<'_>) {
     out.alert(Severity::Warn, format!("R10 protocol error: {e}"));
 }
 
-/// A connected R10. Over BLE it is [`R10`]'s [`DeviceSession`]; over any
+/// A connected R10. Over BLE it is [`R10`]'s [`FrpSession`]; over any
 /// other [`Transport`] (from `R10::connect_with`, `testing` feature) the same methods are
 /// inherent.
 pub struct R10Session<T: Transport = BleTransport> {
@@ -358,56 +354,44 @@ impl<T: Transport> std::fmt::Debug for R10Session<T> {
 }
 
 impl<T: Transport> R10Session<T> {
-    /// [`DeviceSession::poll`]: read and handle what the device sends for
-    /// about `timeout`.
+    /// [`FrpSession::step`]: read and handle what the device sends at
+    /// `now`. Returns [`Activity::Active`] after an event or a protocol error, and
+    /// [`Activity::Idle`] once three polls in a row found nothing (a read can
+    /// bring part of a message).
     ///
     /// # Errors
     ///
     /// Returns [`Error::Protocol`] with the transport error that ended the
     /// connection.
-    pub fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), Error> {
-        let deadline = Instant::now() + timeout;
+    pub fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
         let capture = out.wants_raw() || out.enabled(Level::Trace);
         self.client.transport_mut().set_enabled(capture);
-        let mut idle = 0;
-        loop {
-            let result = self.client.poll();
+        for _ in 0..IDLE_POLLS {
+            let result = self.client.poll_at(now);
             self.flush_raw(out, true);
             match result {
                 Ok(Some(event)) => {
-                    idle = 0;
                     self.handle(event, out);
+                    return Ok(Activity::Active);
                 }
-                // A read can bring part of a message: sleep only once
-                // several polls in a row found nothing.
-                Ok(None) => {
-                    idle += 1;
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        break;
-                    }
-                    if idle >= IDLE_POLLS {
-                        thread::sleep(left.min(IDLE_SLEEP));
-                    }
-                }
+                Ok(None) => {}
                 Err(e @ crate::Error::Transport(_)) => return Err(e.into()),
-                Err(e) => protocol_error(&e, out),
-            }
-            if Instant::now() >= deadline {
-                break;
+                Err(e) => {
+                    protocol_error(&e, out);
+                    return Ok(Activity::Active);
+                }
             }
         }
-        self.flush_raw(out, true);
-        Ok(())
+        Ok(Activity::Idle)
     }
 
-    /// [`DeviceSession::identity`].
+    /// [`FrpSession::identity`].
     #[must_use]
     pub fn identity(&self) -> &DeviceIdentity {
         &self.identity
     }
 
-    /// [`DeviceSession::close`]: raise the `not_armed` blocker and release the
+    /// [`FrpSession::close`]: raise the `not_armed` blocker and release the
     /// device. Over BLE that disconnects on btleplug (bounded at 4 s) and
     /// drops the connection on BlueZ.
     ///
@@ -537,11 +521,11 @@ impl<T: Transport> R10Session<T> {
     }
 }
 
-impl DeviceSession for R10Session {
+impl FrpSession for R10Session {
     type Driver = R10;
 
-    fn poll(&mut self, timeout: Duration, out: &mut Events<'_>) -> Result<(), Error> {
-        R10Session::poll(self, timeout, out)
+    fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
+        R10Session::step(self, now, out)
     }
 
     fn identity(&self) -> &DeviceIdentity {

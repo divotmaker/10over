@@ -4,7 +4,7 @@
 //!
 //! - `ble` (default): platform BLE transport (`BleTransport`).
 //! - `config`: the driver's settings (`config::Config`), with no BLE stack.
-//! - `driver`: the flightrelay `DeviceDriver` for the R10 (`driver::R10`);
+//! - `driver`: the flightrelay `FrpDriver` for the R10 (`driver::R10`);
 //!   implies `config` and `ble`.
 //! - `frp`: the `tenover-frp` binary, the driver served over the Flight
 //!   Relay Protocol; implies `driver`.

@@ -24,7 +24,7 @@ ble = [
 serde = ["dep:serde"]
 # The driver's settings (`config::Config`), with no BLE stack.
 config = ["dep:flightrelay", "flightrelay/config", "serde"]
-# The flightrelay `DeviceDriver` for the R10 (`driver::R10`).
+# The flightrelay `FrpDriver` for the R10 (`driver::R10`).
 driver = ["config", "ble", "flightrelay/driver"]
 # The `tenover-frp` binary: the driver served over FRP.
 frp = ["driver", "flightrelay/server", "flightrelay/main"]

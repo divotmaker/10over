@@ -170,6 +170,18 @@ impl<T: Transport> Client<T> {
     /// or transport errors.
     #[must_use = "poll() returns events that must be handled"]
     pub fn poll(&mut self) -> Result<Option<Event>, Error> {
+        self.poll_at(Instant::now())
+    }
+
+    /// [`poll`](Self::poll) at the time `now`, which dates a shot for
+    /// deduplication: the same device shot ID within 60 s of the first is a
+    /// retransmit.
+    ///
+    /// # Errors
+    ///
+    /// As [`poll`](Self::poll).
+    #[must_use = "poll_at() returns events that must be handled"]
+    pub fn poll_at(&mut self, now: Instant) -> Result<Option<Event>, Error> {
         // Drain any pending event before reading more data.
         if let Some(event) = self.pending_event.take() {
             return Ok(Some(event));
@@ -199,7 +211,7 @@ impl<T: Transport> Client<T> {
         // frames when returning an event early).
         if let Some(frame_result) = self.stream_buf.next_frame() {
             let frame = frame_result?;
-            if let Some(event) = self.dispatch_frame(&frame)? {
+            if let Some(event) = self.dispatch_frame(&frame, now)? {
                 return Ok(Some(event));
             }
         }
@@ -250,7 +262,7 @@ impl<T: Transport> Client<T> {
         }
     }
 
-    fn dispatch_frame(&mut self, frame: &GfdiFrame) -> Result<Option<Event>, Error> {
+    fn dispatch_frame(&mut self, frame: &GfdiFrame, now: Instant) -> Result<Option<Event>, Error> {
         match frame.msg_type {
             gfdi::MSG_DEVICE_INFO => self.handle_device_info(&frame.payload),
             gfdi::MSG_CONFIGURATION => self.handle_configuration(&frame.payload),
@@ -260,7 +272,7 @@ impl<T: Transport> Client<T> {
                 Ok(None)
             }
             gfdi::MSG_PROTOBUF_REQUEST | gfdi::MSG_PROTOBUF_RESPONSE => {
-                let event = self.handle_protobuf(&frame.payload, frame.msg_type)?;
+                let event = self.handle_protobuf(&frame.payload, now)?;
                 self.send_ack(frame.msg_type, 0, &[])?;
                 Ok(event)
             }
@@ -311,7 +323,7 @@ impl<T: Transport> Client<T> {
         Ok(None)
     }
 
-    fn handle_protobuf(&mut self, payload: &[u8], _msg_type: u16) -> Result<Option<Event>, Error> {
+    fn handle_protobuf(&mut self, payload: &[u8], now: Instant) -> Result<Option<Event>, Error> {
         let (_hdr, pb_data) = gfdi::parse_frag_header(payload)?;
         let envelope_event = proto::decode_envelope(pb_data)?;
 
@@ -355,7 +367,6 @@ impl<T: Transport> Client<T> {
                 Ok(None)
             }
             EnvelopeEvent::Shot(shot) => {
-                let now = Instant::now();
                 // Prune shots older than the dedup window.
                 self.recent_shots
                     .retain(|(_, t)| now.duration_since(*t).as_secs() < SHOT_DEDUP_WINDOW_SECS);
@@ -428,6 +439,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
+    use std::time::Duration;
 
     /// Mock transport for testing.
     struct MockTransport {
@@ -498,6 +510,40 @@ mod tests {
         let event = client.poll().unwrap();
         assert!(matches!(event, Some(Event::Registered { handle: 1 })));
         assert_eq!(client.phase(), "wait_device_info");
+    }
+
+    #[test]
+    fn a_shot_id_seen_within_the_window_is_a_retransmit() {
+        let transport = MockTransport::new();
+        let rx = Rc::clone(&transport.rx);
+        let mut client = Client::new(transport, 20);
+        client.start().unwrap();
+        rx.borrow_mut()
+            .push_back(crate::testing::register_response(1));
+        let t0 = Instant::now();
+        assert!(matches!(
+            client.poll_at(t0).unwrap(),
+            Some(Event::Registered { handle: 1 })
+        ));
+        let mut shot_at = |now: Instant| {
+            let frame =
+                crate::testing::protobuf_frame(&crate::testing::shot_envelope(7, 2800.0, 0.0));
+            rx.borrow_mut()
+                .extend(crate::testing::chunks(1, &frame, 20));
+            let mut events = Vec::new();
+            for _ in 0..64 {
+                if let Some(event) = client.poll_at(now).unwrap() {
+                    events.push(event);
+                }
+            }
+            events.iter().any(|e| matches!(e, Event::Shot(_)))
+        };
+        let window = Duration::from_secs(SHOT_DEDUP_WINDOW_SECS);
+        assert!(shot_at(t0));
+        assert!(!shot_at(
+            t0 + Duration::from_secs(SHOT_DEDUP_WINDOW_SECS - 1)
+        ));
+        assert!(shot_at(t0 + window));
     }
 
     #[test]
