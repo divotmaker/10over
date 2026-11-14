@@ -42,7 +42,6 @@ fn main() {
                 Event::HandshakeComplete => {
                     eprintln!("handshake complete");
                 }
-                Event::Subscribed { .. } | Event::WakeResult { .. } => {}
                 Event::EnvironmentResult { success } => {
                     eprintln!("environment result: success={success}");
                 }
@@ -92,6 +91,7 @@ fn main() {
                         println!("  Tempo: backswing {tempo}ms  downswing {down}ms");
                     }
                 }
+                _ => {}
             },
             Ok(None) => {
                 thread::sleep(Duration::from_millis(5));

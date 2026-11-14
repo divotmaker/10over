@@ -21,6 +21,7 @@ use crate::client::Transport;
 
 /// Errors from BLE transport setup.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BleError {
     /// BlueZ backend error (Linux).
     #[cfg(ble_backend_bluez)]
@@ -37,6 +38,7 @@ pub enum BleError {
 ///
 /// On Linux, delegates to `BlueZTransport` (D-Bus file descriptors).
 /// On Windows/macOS, delegates to `BtleplugTransport` (async bridge).
+#[non_exhaustive]
 pub enum BleTransport {
     /// BlueZ file-descriptor transport (Linux).
     #[cfg(ble_backend_bluez)]

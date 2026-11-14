@@ -69,6 +69,7 @@ const WRITE_CHANNEL_CAP: usize = 32;
 
 /// Errors from btleplug transport setup.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BtleplugError {
     /// btleplug library error.
     #[error("btleplug: {0}")]

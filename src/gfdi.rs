@@ -640,10 +640,7 @@ mod tests {
         assert_eq!(f.msg_type(), MSG_PROTOBUF_REQUEST);
         assert_eq!(f.payload(), b"a\x00b");
         assert_eq!(f.txn_id(), None);
-        assert!(matches!(
-            parse_cobs_frame(&[0x09, 0x41]),
-            Err(Error::Cobs(_))
-        ));
+        assert!(matches!(parse_cobs_frame(&[0x09, 0x41]), Err(Error::Cobs)));
         assert!(matches!(
             parse_cobs_frame(&[0x03, 0x41, 0x42]),
             Err(Error::FrameTooShort { .. })

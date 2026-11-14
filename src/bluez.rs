@@ -62,6 +62,7 @@ const SERVICES_POLLS: u32 = 50;
 
 /// Errors from BlueZ transport setup.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BlueZError {
     /// D-Bus communication error.
     #[error("D-Bus error: {0}")]

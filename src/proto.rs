@@ -42,24 +42,35 @@ use prost::Message;
 /// Timing values are absolute device timestamps in milliseconds.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct ShotData {
+    /// The device's shot number; a retransmitted shot repeats it.
     pub shot_id: u32,
+    /// Warmup swing or regular shot.
     pub kind: ShotKind,
+    /// Ball launch data, when the device tracked the ball.
     pub ball: Option<BallData>,
+    /// Club data, when the device reported it.
     pub club: Option<ClubData>,
+    /// Swing timing, when the device reported it.
     pub swing: Option<SwingData>,
 }
 
 /// Whether the device flagged a shot as a warmup swing or a regular one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum ShotKind {
+    /// A warmup swing.
     Warmup,
+    /// A regular shot.
     Regular,
 }
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// Ball launch data of a shot.
+#[non_exhaustive]
 pub struct BallData {
     /// Vertical launch angle (degrees).
     pub launch_angle: f32,
@@ -82,6 +93,8 @@ pub struct BallData {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// How the device determined the spin.
+#[non_exhaustive]
 pub enum SpinCalcType {
     /// Estimated from the other launch values (the R10's default with an
     /// unmarked ball).
@@ -96,6 +109,8 @@ pub enum SpinCalcType {
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// Club data of a shot.
+#[non_exhaustive]
 pub struct ClubData {
     /// Club head velocity at impact (m/s).
     pub club_head_speed: f32,
@@ -109,6 +124,8 @@ pub struct ClubData {
 
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// Swing timing of a shot.
+#[non_exhaustive]
 pub struct SwingData {
     /// Backswing start (ms, absolute device time).
     pub backswing_start: u32,
@@ -123,18 +140,24 @@ pub struct SwingData {
 /// R10 device state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum DeviceState {
+    /// Idle, not armed.
     Standby,
+    /// Checking the radar for interference.
     NoiseCheck,
+    /// Armed, waiting for a shot.
     Waiting,
+    /// Recording a shot.
     Recording,
+    /// Processing a recorded shot.
     Processing,
+    /// In an error state.
     Error,
 }
 
 impl DeviceState {
-    #[must_use]
-    pub fn from_proto(v: i32) -> Option<Self> {
+    pub(crate) fn from_proto(v: i32) -> Option<Self> {
         match v {
             0 => Some(Self::Standby),
             1 => Some(Self::NoiseCheck),
@@ -150,26 +173,42 @@ impl DeviceState {
 /// R10 device error.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub struct DeviceError {
+    /// What went wrong.
     pub code: ErrorCode,
+    /// How serious it is.
     pub severity: ErrorSeverity,
+    /// The device's attitude as `(roll, pitch)` in degrees, when the error
+    /// carries a reading.
     pub tilt: Option<(f32, f32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// The kind of a [`DeviceError`].
+#[non_exhaustive]
 pub enum ErrorCode {
+    /// A code this crate does not know.
     Unknown,
+    /// The device is too hot.
     Overheating,
+    /// The radar is saturated.
     RadarSaturation,
+    /// The device is not level.
     NotLevel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+/// The severity of a [`DeviceError`].
+#[non_exhaustive]
 pub enum ErrorSeverity {
+    /// A warning; the device goes on.
     Warning,
+    /// A serious error.
     Serious,
+    /// A fatal error.
     Fatal,
 }
 
@@ -177,7 +216,7 @@ pub enum ErrorSeverity {
 
 /// Build the envelope that subscribes to the R10's shot-data alerts.
 #[must_use]
-pub fn build_subscribe_request() -> Vec<u8> {
+pub(crate) fn build_subscribe_request() -> Vec<u8> {
     use alerts::{AlertChannel, SubscribeCommand, Topic, TopicSelection};
 
     let subscribe = SubscribeCommand {
@@ -224,7 +263,7 @@ fn monitor_envelope(channel: monitor::MonitorChannel) -> Vec<u8> {
 
 /// Build the envelope carrying a [`Environment`] (environment settings).
 #[must_use]
-pub fn build_environment_request(config: &Environment) -> Vec<u8> {
+pub(crate) fn build_environment_request(config: &Environment) -> Vec<u8> {
     use monitor::{EnvironmentSettings, MonitorChannel};
 
     monitor_envelope(MonitorChannel {
@@ -241,7 +280,7 @@ pub fn build_environment_request(config: &Environment) -> Vec<u8> {
 
 /// Build the envelope that wakes (arms) the R10.
 #[must_use]
-pub fn build_wakeup_request() -> Vec<u8> {
+pub(crate) fn build_wakeup_request() -> Vec<u8> {
     use monitor::{MonitorChannel, WakeCommand};
 
     monitor_envelope(MonitorChannel {
@@ -252,7 +291,7 @@ pub fn build_wakeup_request() -> Vec<u8> {
 
 /// Outcome of decoding a protobuf envelope from the R10.
 #[derive(Debug, Clone)]
-pub enum EnvelopeEvent {
+pub(crate) enum EnvelopeEvent {
     /// Reply to the shot-data subscription (accepted or rejected).
     SubscribeResult { success: bool },
     /// Reply to the wake (arm) command. `status` 0 = woken, 1 = already
@@ -266,6 +305,8 @@ pub enum EnvelopeEvent {
     Error(DeviceError),
     /// Leveling check report. `verdict` 1 = level, 2 = releveling advised,
     /// 3 = releveling needed; `attempt` 0 = ok, 1 = failed, 2 = device moved.
+    // The client has no event for it; the wire tests read the fields.
+    #[allow(dead_code)]
     LevelCheck { verdict: i32, attempt: i32 },
     /// Reply to an environment ([`Environment`]) update.
     EnvironmentResult { success: bool },
@@ -280,7 +321,7 @@ pub enum EnvelopeEvent {
 /// # Errors
 ///
 /// Returns `Err` if protobuf deserialization fails.
-pub fn decode_envelope(pb_data: &[u8]) -> Result<EnvelopeEvent, prost::DecodeError> {
+pub(crate) fn decode_envelope(pb_data: &[u8]) -> Result<EnvelopeEvent, prost::DecodeError> {
     let env = envelope::Envelope::decode(pb_data)?;
 
     // Alert channel (field 30)

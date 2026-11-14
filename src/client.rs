@@ -65,9 +65,13 @@ pub trait Transport {
 
 /// Events emitted by the client.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Event {
     /// MultiLink registration succeeded, GFDI handshake starting.
-    Registered { handle: u8 },
+    Registered {
+        /// The MultiLink handle the device assigned.
+        handle: u8,
+    },
     /// GFDI handshake complete, protobuf session starting.
     HandshakeComplete,
     /// Device is armed and waiting for a shot.
@@ -78,13 +82,22 @@ pub enum Event {
     StateChange(DeviceState),
     /// Device reported an error.
     DeviceError(DeviceError),
-    /// Subscribe response received.
-    Subscribed { success: bool },
+    /// Reply to the shot-data subscription.
+    Subscribed {
+        /// The device accepted it.
+        success: bool,
+    },
     /// Reply to the wake (arm) command. `status` 0 = woken, 1 = already
     /// active from a previous session, 2 = failed.
-    WakeResult { status: i32 },
+    WakeResult {
+        /// The device's status code.
+        status: i32,
+    },
     /// Reply to an environment update sent with [`Client::send_environment`].
-    EnvironmentResult { success: bool },
+    EnvironmentResult {
+        /// The device accepted the settings.
+        success: bool,
+    },
 }
 
 /// Client state machine phases.
