@@ -48,8 +48,8 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use flightrelay::driver::{
-    Activity, Backoff, ConfigError, ConnectCtx, DeviceIdentity, DriverConfig, DriverInfo, Events,
-    FrpDriver, FrpSession, IDLE, Level, Live, NoAction, RawProfile, SessionEnd, ShotIds, Stopped,
+    Activity, ConfigError, ConnectCtx, DeviceIdentity, DriverConfig, DriverInfo, Events, FrpDriver,
+    FrpSession, IDLE, Level, Live, NoAction, RawProfile, ShotIds, Stopped,
 };
 use flightrelay::{RawFrame, Severity, Source};
 
@@ -234,20 +234,6 @@ impl FrpDriver for R10 {
             mtu.into(),
             BleTransport::disconnect,
         )
-    }
-
-    /// A warn alert naming the R10 for every failed attempt, then the
-    /// backoff.
-    fn retry_delay(
-        &mut self,
-        ended: &SessionEnd<'_, Error>,
-        backoff: &mut Backoff,
-        out: &mut Events<'_>,
-    ) -> Option<Duration> {
-        if let Some(error) = ended.error {
-            out.alert(Severity::Warn, format!("R10 connection error: {error}"));
-        }
-        Some(backoff.delay(ended.connected_for))
     }
 
     fn apply_config(&mut self, new: &Config) {
@@ -463,11 +449,9 @@ impl<T: Transport> FrpSession for R10Session<T> {
         &self.identity
     }
 
-    /// Raise the `not_armed` blocker and release the device. Over BLE that
-    /// disconnects on btleplug (bounded at 4 s) and drops the connection on
-    /// BlueZ. Never fails.
-    fn close(mut self, out: &mut Events<'_>) -> Result<(), Error> {
-        out.ready(false);
+    /// Release the device. Over BLE that disconnects on btleplug (bounded at
+    /// 4 s) and drops the connection on BlueZ. Never fails.
+    fn close(mut self, _: &mut Events<'_>) -> Result<(), Error> {
         (self.release)(self.client.transport_mut().inner_mut());
         Ok(())
     }

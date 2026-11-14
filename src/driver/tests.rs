@@ -598,24 +598,6 @@ fn a_transport_error_ends_the_session() {
         matches!(err, Error::Protocol(crate::Error::Transport(_))),
         "{err}"
     );
-
-    let mut backoff = Backoff::default();
-    let ended = SessionEnd {
-        error: Some(&err),
-        connected_for: Some(Duration::from_secs(1)),
-        attempts: 0,
-    };
-    assert_eq!(
-        rig.host
-            .with(|_, out| d.retry_delay(&ended, &mut backoff, out)),
-        Some(Duration::from_secs(1))
-    );
-    let events = rig.take();
-    assert!(matches!(
-        alerts(&events).last(),
-        Some(a) if a.severity == Severity::Warn
-            && a.message.starts_with("R10 connection error: transport error:")
-    ));
 }
 
 #[test]
@@ -626,17 +608,6 @@ fn a_stop_ends_the_handshake() {
     let mut d = driver(None);
     let err = rig.connect(&mut d, &fake).unwrap_err();
     assert!(matches!(err, Error::Stopped), "{err}");
-}
-
-#[test]
-fn close_reports_not_ready() {
-    let fake = Fake::default();
-    let mut rig = Rig::new(false);
-    let mut d = driver(None);
-    let session = armed(&mut rig, &mut d, &fake);
-    rig.take();
-    rig.close(session).expect("close");
-    assert_eq!(statuses(&rig.take()), [DeviceStatus::not_armed()]);
 }
 
 #[test]
