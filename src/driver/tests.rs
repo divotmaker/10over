@@ -3,10 +3,12 @@ use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
 
-use flightrelay::driver::{DeviceEvent, StatusChange};
-use flightrelay::testing::TestHost;
+use flightrelay::driver::{DeviceEvent, DeviceStatus};
+use flightrelay::testing::{
+    TestHost, alerts, bodies, clubs, kinds, launches, raw_frames, status, statuses,
+};
 use flightrelay::units::Distance;
-use flightrelay::{BusAlert, Launch, RawDir, ShotTrigger};
+use flightrelay::{FrpBody, Launch, RawDir, ShotTrigger};
 
 use super::*;
 use crate::gfdi::{MSG_CONFIGURATION, MSG_DEVICE_INFO};
@@ -85,14 +87,6 @@ impl Transport for Fake {
     }
 }
 
-/// What reaches the bus: a message body, or a change to the actor's status.
-#[derive(Debug)]
-#[allow(clippy::large_enum_variant)] // a test's handful of values
-enum Out {
-    Frp(FrpBody),
-    Change(StatusChange),
-}
-
 /// The host side of a test: a [`TestHost`] (flags, stepped clock, sink) and
 /// the events taken from it that no assertion has consumed yet.
 struct Rig {
@@ -141,28 +135,19 @@ impl Rig {
         self.host.with(|_, out| session.close(out))
     }
 
-    /// Take the messages and status changes seen so far.
-    fn frp(&mut self) -> Vec<Out> {
+    /// Take the events seen so far.
+    fn take(&mut self) -> Vec<DeviceEvent> {
         self.events.extend(self.host.take());
-        self.events
-            .drain(..)
-            .filter_map(|e| match e {
-                DeviceEvent::Frp(f) => Some(Out::Frp(f)),
-                DeviceEvent::StatusChange(c) => Some(Out::Change(c)),
-                _ => None,
-            })
-            .collect()
+        std::mem::take(&mut self.events)
     }
 
     /// The log lines at `level` seen so far.
     fn logs(&mut self, level: Level) -> Vec<String> {
         self.events.extend(self.host.take());
-        self.events
-            .iter()
-            .filter_map(|e| match e {
-                DeviceEvent::Log(l, line) if *l == level => Some(line.clone()),
-                _ => None,
-            })
+        flightrelay::testing::logs(&self.events)
+            .into_iter()
+            .filter(|(l, _)| *l == level)
+            .map(|(_, line)| line.to_owned())
             .collect()
     }
 }
@@ -181,84 +166,6 @@ fn aimed_driver(aim_offset_deg: f64) -> R10 {
         ..Config::default()
     })
     .expect("valid config")
-}
-
-fn clubs(events: &[Out]) -> Vec<flightrelay::types::ClubData> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            Out::Frp(FrpBody::ShotClub(m)) => Some(m.club.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn kinds(events: &[Out]) -> Vec<&'static str> {
-    events
-        .iter()
-        .map(|e| match e {
-            Out::Frp(FrpBody::ShotTrigger(_)) => "trigger",
-            Out::Frp(FrpBody::ShotLaunch(_)) => "launch",
-            Out::Frp(FrpBody::ShotClub(_)) => "club",
-            Out::Frp(FrpBody::ShotFinished(_)) => "finished",
-            Out::Frp(FrpBody::BusAlert(_)) => "alert",
-            Out::Frp(FrpBody::ShotRaw(_)) => "raw",
-            Out::Change(_) => "status",
-            Out::Frp(_) => "other",
-        })
-        .collect()
-}
-
-/// Every status change as pairs, in order: `blockers` (comma-separated),
-/// `tilt`, `roll` and `battery_pct` for a reading (`none` for no reading),
-/// then each telemetry key (`none` for a removed one).
-fn status(events: &[Out]) -> Vec<(String, String)> {
-    let reading = |v: Option<String>| v.unwrap_or_else(|| "none".to_owned());
-    events
-        .iter()
-        .filter_map(|e| match e {
-            Out::Change(StatusChange::Blockers(b)) => Some(vec![pair("blockers", &b.join(","))]),
-            Out::Change(StatusChange::Battery(b)) => Some(vec![(
-                "battery_pct".to_owned(),
-                reading(b.map(|b| b.to_string())),
-            )]),
-            Out::Change(StatusChange::Attitude { tilt, roll }) => Some(vec![
-                ("tilt".to_owned(), reading(tilt.map(|t| t.to_string()))),
-                ("roll".to_owned(), reading(roll.map(|r| r.to_string()))),
-            ]),
-            Out::Change(StatusChange::Telemetry(t)) => Some(
-                t.iter()
-                    .map(|(k, v)| (k.clone(), reading(v.clone())))
-                    .collect(),
-            ),
-            Out::Change(_) | Out::Frp(_) => None,
-        })
-        .flatten()
-        .collect()
-}
-
-fn pair(k: &str, v: &str) -> (String, String) {
-    (k.to_owned(), v.to_owned())
-}
-
-fn launches(events: &[Out]) -> Vec<Launch> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            Out::Frp(FrpBody::ShotLaunch(m)) => Some(m.launch.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn raw_frames(events: &[Out]) -> Vec<RawFrame> {
-    events
-        .iter()
-        .filter_map(|e| match e {
-            Out::Frp(FrpBody::ShotRaw(f)) => Some(f.clone()),
-            _ => None,
-        })
-        .collect()
 }
 
 /// A connected session that has been armed (subscribe, wake, waiting).
@@ -319,9 +226,9 @@ fn handshake_identifies_the_r10_and_keeps_its_messages_private() {
     assert!(audit.iter().any(|l| l.starts_with("rx register ")));
     assert!(audit.iter().any(|l| l.starts_with("rx notify 13a0 ")));
     assert!(audit.iter().any(|l| l.starts_with("tx write 1388 ")));
-    let frp = rig.frp();
-    assert!(raw_frames(&frp).is_empty(), "{frp:?}");
-    assert_eq!(status(&frp), [pair("blockers", "not_armed")]);
+    let events = rig.take();
+    assert!(raw_frames(&events).is_empty(), "{events:?}");
+    assert_eq!(statuses(&events), [DeviceStatus::not_armed()]);
 }
 
 #[test]
@@ -330,40 +237,27 @@ fn shot_sends_each_event_once_and_numbers_keep_counting() {
     let mut rig = Rig::new(false);
     let mut d = driver(None);
     let mut session = armed(&mut rig, &mut d, &fake);
-    let frp = rig.frp();
     assert_eq!(
-        status(&frp),
-        [
-            pair("blockers", "not_armed"),
-            // Arming takes a leftover attitude reading off the actor.
-            pair("tilt", "none"),
-            pair("roll", "none"),
-            pair("blockers", ""),
-            pair("device_state", "waiting"),
-        ]
+        status(&rig.take()),
+        DeviceStatus::new().with_telemetry("device_state", "waiting")
     );
 
     fake.send_envelope(&testing::shot_envelope(41, 2800.0, 5.0));
     rig.poll(&mut session).expect("poll");
-    let frp = rig.frp();
+    let events = rig.take();
     assert_eq!(
-        kinds(&frp),
-        ["trigger", "launch", "club", "finished", "status", "status"]
+        kinds(&events),
+        ["shot.trigger", "shot.launch", "shot.club", "shot.finished"]
     );
-    let Out::Frp(FrpBody::ShotTrigger(ShotTrigger { key, timestamp })) = &frp[0] else {
+    let FrpBody::ShotTrigger(ShotTrigger { key, timestamp }) = bodies(&events)[0] else {
         panic!("trigger first");
     };
     assert_eq!(key.shot_number, 1);
     assert_eq!(*timestamp, None, "the R10 has no wall clock");
-    assert_eq!(
-        status(&frp),
-        [
-            pair("tilt", "none"),
-            pair("roll", "none"),
-            pair("blockers", "not_armed")
-        ]
-    );
-    let launch = &launches(&frp)[0];
+    let after = status(&events);
+    assert_eq!(after.blockers, ["not_armed"]);
+    assert_eq!((after.tilt, after.roll), (None, None));
+    let launch = launches(&events)[0];
     assert_eq!(launch.total_spin_rpm, Some(2800));
     // The wire's tilt of 5 is 5° left: the axis and sidespin are negative.
     assert_eq!(launch.spin_axis, Some(-5.0));
@@ -373,16 +267,16 @@ fn shot_sends_each_event_once_and_numbers_keep_counting() {
     // A retransmit of the same device shot is not a new shot.
     fake.send_envelope(&testing::shot_envelope(41, 2800.0, 5.0));
     rig.poll(&mut session).expect("poll");
-    assert!(kinds(&rig.frp()).iter().all(|k| *k != "trigger"));
+    assert!(!kinds(&rig.take()).contains(&"shot.trigger"));
 
     // A new session of the same driver keeps counting.
     let fake2 = Fake::default();
     let mut session2 = armed(&mut rig, &mut d, &fake2);
-    rig.frp();
+    rig.take();
     fake2.send_envelope(&testing::shot_envelope(1, 2500.0, -3.0));
     rig.poll(&mut session2).expect("poll");
-    let frp = rig.frp();
-    let Out::Frp(FrpBody::ShotTrigger(ShotTrigger { key, .. })) = &frp[0] else {
+    let events = rig.take();
+    let FrpBody::ShotTrigger(ShotTrigger { key, .. }) = bodies(&events)[0] else {
         panic!("trigger first");
     };
     assert_eq!(key.shot_number, 2);
@@ -394,10 +288,11 @@ fn zero_spin_shot_sends_total_zero_with_no_axis() {
     let mut rig = Rig::new(false);
     let mut d = driver(None);
     let mut session = armed(&mut rig, &mut d, &fake);
-    rig.frp();
+    rig.take();
     fake.send_envelope(&testing::shot_envelope(7, 0.0, 4.0));
     rig.poll(&mut session).expect("poll");
-    let launch = &launches(&rig.frp())[0];
+    let events = rig.take();
+    let launch = launches(&events)[0];
     assert_eq!(launch.total_spin_rpm, Some(0));
     assert_eq!(launch.spin_axis, None);
 }
@@ -407,11 +302,11 @@ fn aimed_shot(d: &mut R10, envelope: &[u8]) -> (Launch, flightrelay::types::Club
     let fake = Fake::default();
     let mut rig = Rig::new(false);
     let mut session = armed(&mut rig, d, &fake);
-    rig.frp();
+    rig.take();
     fake.send_envelope(envelope);
     rig.poll(&mut session).expect("poll");
-    let frp = rig.frp();
-    (launches(&frp)[0].clone(), clubs(&frp)[0].clone())
+    let events = rig.take();
+    (launches(&events)[0].clone(), clubs(&events)[0].clone())
 }
 
 #[test]
@@ -454,11 +349,11 @@ fn a_new_aim_offset_applies_to_the_running_session() {
     let mut rig = Rig::new(false);
     let mut d = driver(None);
     let mut session = armed(&mut rig, &mut d, &fake);
-    rig.frp();
+    rig.take();
     fake.send_envelope(&testing::shot_envelope(1, 2800.0, 5.0));
     rig.poll(&mut session).expect("poll");
     assert_eq!(
-        launches(&rig.frp())[0].launch_azimuth,
+        launches(&rig.take())[0].launch_azimuth,
         Some(f64::from(-1.2_f32))
     );
 
@@ -471,7 +366,7 @@ fn a_new_aim_offset_applies_to_the_running_session() {
     fake.send_envelope(&testing::shot_envelope(2, 2800.0, 5.0));
     rig.poll(&mut session).expect("poll");
     assert_eq!(
-        launches(&rig.frp())[0].launch_azimuth,
+        launches(&rig.take())[0].launch_azimuth,
         Some(f64::from(-1.2_f32) + 1.2)
     );
 
@@ -479,7 +374,7 @@ fn a_new_aim_offset_applies_to_the_running_session() {
     fake.send_envelope(&testing::shot_envelope(3, 2800.0, 5.0));
     rig.poll(&mut session).expect("poll");
     assert_eq!(
-        launches(&rig.frp())[0].launch_azimuth,
+        launches(&rig.take())[0].launch_azimuth,
         Some(f64::from(-1.2_f32))
     );
 }
@@ -490,19 +385,16 @@ fn a_shot_takes_a_leveling_reading_off_the_actor() {
     let mut rig = Rig::new(false);
     let mut d = driver(None);
     let mut session = armed(&mut rig, &mut d, &fake);
-    rig.frp();
+    rig.take();
 
     fake.send_envelope(&testing::error_envelope(3, 2, Some((4.5, -6.25))));
     rig.poll(&mut session).expect("poll");
-    assert_eq!(
-        status(&rig.frp()),
-        [pair("tilt", "-6.25"), pair("roll", "4.5")]
-    );
+    let level = status(&rig.take());
+    assert_eq!((level.tilt, level.roll), (Some(-6.25), Some(4.5)));
     fake.send_envelope(&testing::shot_envelope(3, 2800.0, 5.0));
     rig.poll(&mut session).expect("poll");
-    let after = status(&rig.frp());
-    assert!(after.contains(&pair("tilt", "none")), "{after:?}");
-    assert!(after.contains(&pair("roll", "none")), "{after:?}");
+    let after = status(&rig.take());
+    assert_eq!((after.tilt, after.roll), (None, None));
 }
 
 #[test]
@@ -511,7 +403,7 @@ fn states_and_errors_become_status_and_alerts() {
     let mut rig = Rig::new(false);
     let mut d = driver(None);
     let mut session = armed(&mut rig, &mut d, &fake);
-    rig.frp();
+    rig.take();
 
     fake.send_envelope(&testing::state_envelope(3)); // recording
     fake.send_envelope(&testing::state_envelope(0)); // standby: not shown
@@ -519,27 +411,25 @@ fn states_and_errors_become_status_and_alerts() {
     fake.send_envelope(&testing::error_envelope(3, 2, Some((4.5, -6.25))));
     fake.send_envelope(&testing::error_envelope(2, 0, None));
     rig.poll(&mut session).expect("poll");
-    let frp = rig.frp();
+    let events = rig.take();
+    let seen: Vec<_> = statuses(&events)
+        .into_iter()
+        .map(|s| (s.telemetry["device_state"].clone(), s.tilt, s.roll))
+        .collect();
+    let state = |label: &str, tilt, roll| (label.to_owned(), tilt, roll);
     assert_eq!(
-        status(&frp),
+        seen,
         [
-            pair("device_state", "recording"),
-            pair("device_state", "processing"),
-            pair("tilt", "-6.25"),
-            pair("roll", "4.5"),
+            state("recording", None, None),
+            state("processing", None, None),
+            state("processing", Some(-6.25), Some(4.5)),
             // An error without a reading takes the attitude off.
-            pair("tilt", "none"),
-            pair("roll", "none"),
+            state("processing", None, None),
         ]
     );
-    let alerts: Vec<_> = frp
-        .iter()
-        .filter_map(|e| match e {
-            Out::Frp(FrpBody::BusAlert(BusAlert {
-                severity, message, ..
-            })) => Some((*severity, message.clone())),
-            _ => None,
-        })
+    let alerts: Vec<_> = alerts(&events)
+        .into_iter()
+        .map(|a| (a.severity, a.message.clone()))
         .collect();
     assert_eq!(
         alerts,
@@ -559,7 +449,7 @@ fn raw_frames_are_whole_messages_before_their_shot_and_never_identity() {
     let mut rig = Rig::new(true);
     let mut d = driver(None);
     let mut session = armed(&mut rig, &mut d, &fake);
-    rig.frp();
+    rig.take();
 
     // A device information message after the handshake stays private.
     fake.send(&testing::device_info_frame());
@@ -567,9 +457,9 @@ fn raw_frames_are_whole_messages_before_their_shot_and_never_identity() {
     fake.send(&shot);
     rig.poll(&mut session).expect("poll");
     let audit = rig.logs(Level::Trace);
-    let frp = rig.frp();
+    let events = rig.take();
 
-    let frames = raw_frames(&frp);
+    let frames = raw_frames(&events);
     assert!(
         frames
             .iter()
@@ -587,11 +477,17 @@ fn raw_frames_are_whole_messages_before_their_shot_and_never_identity() {
     // The shot message is one frame (it crossed as several chunks), sent
     // before the shot events built from it, then our ACK of it.
     let shot_frame = crate::cobs::decode(&shot[1..shot.len() - 1]).unwrap();
-    let k = kinds(&frp);
-    let first_raw = k.iter().position(|k| *k == "raw").expect("a raw frame");
-    let trigger = k.iter().position(|k| *k == "trigger").expect("a trigger");
+    let k = kinds(&events);
+    let first_raw = k
+        .iter()
+        .position(|k| *k == "shot.raw")
+        .expect("a raw frame");
+    let trigger = k
+        .iter()
+        .position(|k| *k == "shot.trigger")
+        .expect("a trigger");
     assert!(first_raw < trigger);
-    let Out::Frp(FrpBody::ShotRaw(f)) = &frp[first_raw] else {
+    let FrpBody::ShotRaw(f) = bodies(&events)[first_raw] else {
         unreachable!()
     };
     assert_eq!(f.dir, RawDir::Rx);
@@ -613,7 +509,7 @@ fn no_raw_frames_unless_wanted() {
     let mut session = armed(&mut rig, &mut d, &fake);
     fake.send_envelope(&testing::shot_envelope(9, 3000.0, 2.0));
     rig.poll(&mut session).expect("poll");
-    assert!(raw_frames(&rig.frp()).is_empty());
+    assert!(raw_frames(&rig.take()).is_empty());
 }
 
 #[test]
@@ -628,7 +524,8 @@ fn the_tee_distance_goes_out_after_the_wake() {
         tee_distance_yd: Some(2.5),
         ..crate::proto::Environment::default()
     });
-    let frames = raw_frames(&rig.frp());
+    let events = rig.take();
+    let frames = raw_frames(&events);
     assert!(
         frames
             .iter()
@@ -655,7 +552,8 @@ fn without_a_range_nothing_is_sent_after_the_wake() {
     rig.poll(&mut session).expect("poll");
     // The only request after the handshake is the wake: no environment.
     let wake = crate::proto::build_wakeup_request();
-    let requests: Vec<_> = raw_frames(&rig.frp())
+    let events = rig.take();
+    let requests: Vec<_> = raw_frames(&events)
         .into_iter()
         .filter(|f| f.label.as_deref() == Some("write 13b3"))
         .collect();
@@ -674,18 +572,18 @@ fn a_protocol_error_is_an_alert_and_the_session_goes_on() {
     let mut rig = Rig::new(false);
     let mut d = driver(None);
     let mut session = armed(&mut rig, &mut d, &fake);
-    rig.frp();
+    rig.take();
     // A protobuf message whose envelope does not decode.
     fake.send(&testing::protobuf_frame(&[0xff, 0xff, 0xff]));
     fake.send_envelope(&testing::shot_envelope(3, 2000.0, 1.0));
     rig.poll(&mut session).expect("poll goes on");
-    let frp = rig.frp();
-    assert!(frp.iter().any(|e| matches!(
-        e,
-        Out::Frp(FrpBody::BusAlert(BusAlert { severity: Severity::Warn, message, .. }))
-            if message.starts_with("R10 protocol error:")
-    )));
-    assert!(kinds(&frp).contains(&"trigger"));
+    let events = rig.take();
+    assert!(
+        alerts(&events)
+            .iter()
+            .any(|a| a.severity == Severity::Warn && a.message.starts_with("R10 protocol error:"))
+    );
+    assert!(kinds(&events).contains(&"shot.trigger"));
 }
 
 #[test]
@@ -712,11 +610,11 @@ fn a_transport_error_ends_the_session() {
             .with(|_, out| d.retry_delay(&ended, &mut backoff, out)),
         Some(Duration::from_secs(1))
     );
-    let frp = rig.frp();
+    let events = rig.take();
     assert!(matches!(
-        frp.last(),
-        Some(Out::Frp(FrpBody::BusAlert(BusAlert { severity: Severity::Warn, message, .. })))
-            if message.starts_with("R10 connection error: transport error:")
+        alerts(&events).last(),
+        Some(a) if a.severity == Severity::Warn
+            && a.message.starts_with("R10 connection error: transport error:")
     ));
 }
 
@@ -736,9 +634,9 @@ fn close_reports_not_ready() {
     let mut rig = Rig::new(false);
     let mut d = driver(None);
     let session = armed(&mut rig, &mut d, &fake);
-    rig.frp();
+    rig.take();
     rig.close(session).expect("close");
-    assert_eq!(status(&rig.frp()), [pair("blockers", "not_armed")]);
+    assert_eq!(statuses(&rig.take()), [DeviceStatus::not_armed()]);
 }
 
 #[test]
@@ -753,18 +651,6 @@ fn close_releases_the_device() {
     assert_eq!(fake.0.borrow().released, 0);
     rig.close(session).expect("close");
     assert_eq!(fake.0.borrow().released, 1);
-}
-
-#[test]
-fn a_stop_as_the_connect_succeeds_releases_the_transport() {
-    let fake = Fake::default();
-    let result = finish_scan(Ok(fake.clone()), true, Fake::release);
-    assert!(matches!(result, Err(Error::Stopped)));
-    assert_eq!(fake.0.borrow().released, 1);
-
-    // Without a stop the transport is handed over, still connected.
-    let kept = finish_scan(Ok(fake.clone()), false, Fake::release).expect("connected");
-    assert_eq!(kept.0.borrow().released, 1);
 }
 
 /// A fake that registers, then answers every read with a NAK: no poll is
@@ -848,7 +734,7 @@ fn messages_are_captured_only_while_someone_can_receive_them() {
     fake.send_envelope(&testing::shot_envelope(9, 3000.0, 2.0));
     rig.poll(&mut session).expect("poll");
     assert!(session.client.transport().enabled());
-    assert!(!raw_frames(&rig.frp()).is_empty());
+    assert!(!raw_frames(&rig.take()).is_empty());
 }
 
 #[test]

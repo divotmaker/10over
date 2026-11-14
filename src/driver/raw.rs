@@ -3,7 +3,6 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use flightrelay::RawDir;
 
@@ -81,14 +80,14 @@ impl Splitter {
                 dir,
                 label: format!("{channel} {:04x}", frame.msg_type()),
                 data,
-                at_ms: now_ms(),
+                at_ms: flightrelay::utc_ms(),
                 private: frame.carries_identity(),
             },
             None => Captured {
                 dir,
                 label: format!("{channel} unparsed"),
                 data: self.frame.clone(),
-                at_ms: now_ms(),
+                at_ms: flightrelay::utc_ms(),
                 private: true,
             },
         }
@@ -151,7 +150,7 @@ impl<T> Tap<T> {
             dir,
             label: "register".to_owned(),
             data: data.to_vec(),
-            at_ms: now_ms(),
+            at_ms: flightrelay::utc_ms(),
             private: false,
         });
     }
@@ -188,14 +187,6 @@ impl<T: Transport> Transport for Tap<T> {
         self.register(RawDir::Tx, data);
         Ok(())
     }
-}
-
-/// The current UTC time in milliseconds since the Unix epoch.
-fn now_ms() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
 }
 
 #[cfg(test)]

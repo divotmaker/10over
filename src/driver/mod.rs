@@ -4,7 +4,7 @@
 //! and turns what it reports into FRP messages. A host drives it:
 //! flightrelay's [`FrpServer`](https://docs.rs/flightrelay/0.7/flightrelay/struct.FrpServer.html)
 //! (the `tenover-frp` binary), or an application with its own loop that
-//! calls [`FrpSession::step`] with the time now, or `poll`. The host
+//! calls [`FrpSession::step`] with the time now. The host
 //! publishes the launch monitor actor's `bus.actor`, with the identity
 //! (manufacturer "Garmin", model "R10") and `source`
 //! ([`Source::Measured`]) in its `device` block.
@@ -45,16 +45,13 @@ pub mod convert;
 mod raw;
 
 use std::fmt::Write as _;
-use std::sync::mpsc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use flightrelay::driver::{
     Activity, Backoff, ConfigError, ConnectCtx, DeviceIdentity, DriverConfig, DriverInfo, Events,
-    FrpDriver, FrpSession, IDLE, Level, Live, NoAction, RawProfile, SessionEnd, ShotIds, Stop,
-    Stopped,
+    FrpDriver, FrpSession, IDLE, Level, Live, NoAction, RawProfile, SessionEnd, ShotIds, Stopped,
 };
-use flightrelay::{FrpBody, RawFrame, Severity, Source};
+use flightrelay::{RawFrame, Severity, Source};
 
 use crate::ble::{BleError, BleTransport};
 use crate::client::{Client, Event, Transport};
@@ -65,8 +62,6 @@ use raw::Tap;
 
 /// Longest wait from the start of the handshake to its end.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// How often the BLE scan calls `ctx.tick()` while it waits.
-const TICK: Duration = Duration::from_millis(100);
 /// Empty polls in a row before a read loop waits ([`IDLE`]).
 const IDLE_POLLS: u32 = 3;
 /// The MTU a session over a test transport uses.
@@ -86,9 +81,9 @@ pub enum Error {
     /// The connection failed: a transport error, or no handshake in time.
     #[error(transparent)]
     Protocol(#[from] crate::Error),
-    /// The thread running the BLE connect could not be started or failed.
+    /// The thread running the BLE connect could not be started or panicked.
     #[error("BLE connect thread: {0}")]
-    Thread(String),
+    Thread(#[source] std::io::Error),
 }
 
 impl From<Stopped> for Error {
@@ -267,58 +262,26 @@ fn no_bulk(_: &RawFrame) -> bool {
 }
 
 /// Find and connect the R10 on a helper thread, ticking while it works and
-/// forwarding its progress lines as debug logs. A stop cancels the scan;
-/// the helper is joined before this returns, so the device is free again.
+/// forwarding its progress lines as debug logs. A stop cancels the scan; a
+/// connection that comes up after a stop is released again.
 fn scan(ctx: &mut ConnectCtx<'_>) -> Result<BleTransport, Error> {
-    let stop: Stop = ctx.stop.clone();
-    let (log_tx, log_rx) = mpsc::channel::<String>();
-    let helper = thread::Builder::new()
-        .name("tenover-ble-connect".to_owned())
-        .spawn(move || {
-            let mut log = |line: &str| {
-                let _ = log_tx.send(line.to_owned());
-            };
-            BleTransport::auto_connect_with(stop.flag(), &mut log)
-        })
-        .map_err(|e| Error::Thread(e.to_string()))?;
-    let mut stopped = false;
-    let mut ticked = Instant::now();
-    loop {
-        match log_rx.recv_timeout(TICK) {
-            Ok(line) => ctx.out.log(Level::Debug, line),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            // The helper is done: its sender is gone.
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-        if !stopped && ticked.elapsed() >= TICK {
-            stopped = ctx.tick().is_err();
-            ticked = Instant::now();
-        }
-    }
-    let result = helper
-        .join()
-        .map_err(|_| Error::Thread("panicked".to_owned()))?;
-    finish_scan(
-        result,
-        stopped || ctx.stop.is_stopped(),
-        BleTransport::disconnect,
-    )
+    let result = ctx.run_blocking(
+        <R10 as FrpDriver>::STOP_WAIT,
+        |cancel, log| {
+            BleTransport::auto_connect_with(cancel, &mut |line: &str| {
+                log(Level::Debug, line.to_owned());
+            })
+        },
+        release,
+    )?;
+    Ok(result.map_err(Error::Thread)??)
 }
 
-/// The outcome of a BLE connect. After a stop, a connection that came up
-/// anyway is released with `release` and the connect ends as stopped.
-fn finish_scan<T>(
-    result: Result<T, BleError>,
-    stopped: bool,
-    release: fn(&mut T),
-) -> Result<T, Error> {
-    if stopped {
-        if let Ok(mut transport) = result {
-            release(&mut transport);
-        }
-        return Err(Error::Stopped);
+/// Free a connection nobody takes: one that came up after a stop.
+fn release(result: Result<BleTransport, BleError>) {
+    if let Ok(mut transport) = result {
+        transport.disconnect();
     }
-    Ok(result?)
 }
 
 /// A transport with nothing to release.
@@ -331,9 +294,8 @@ fn protocol_error(e: &crate::Error, out: &mut Events<'_>) {
     out.alert(Severity::Warn, format!("R10 protocol error: {e}"));
 }
 
-/// A connected R10. Over BLE it is [`R10`]'s [`FrpSession`]; over any
-/// other [`Transport`] (from `R10::connect_with`, `testing` feature) the same methods are
-/// inherent.
+/// A connected R10, [`R10`]'s [`FrpSession`] over BLE. Over any other
+/// [`Transport`] it comes from `R10::connect_with` (`testing` feature).
 pub struct R10Session<T: Transport = BleTransport> {
     client: Client<Tap<T>>,
     identity: DeviceIdentity,
@@ -354,70 +316,11 @@ impl<T: Transport> std::fmt::Debug for R10Session<T> {
 }
 
 impl<T: Transport> R10Session<T> {
-    /// [`FrpSession::step`]: read and handle what the device sends at
-    /// `now`. Returns [`Activity::Active`] after an event or a protocol error, and
-    /// [`Activity::Idle`] once three polls in a row found nothing (a read can
-    /// bring part of a message).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Protocol`] with the transport error that ended the
-    /// connection.
-    pub fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        let capture = out.wants_raw() || out.enabled(Level::Trace);
-        self.client.transport_mut().set_enabled(capture);
-        for _ in 0..IDLE_POLLS {
-            let result = self.client.poll_at(now);
-            self.flush_raw(out, true);
-            match result {
-                Ok(Some(event)) => {
-                    self.handle(event, out);
-                    return Ok(Activity::Active);
-                }
-                Ok(None) => {}
-                Err(e @ crate::Error::Transport(_)) => return Err(e.into()),
-                Err(e) => {
-                    protocol_error(&e, out);
-                    return Ok(Activity::Active);
-                }
-            }
-        }
-        Ok(Activity::Idle)
-    }
-
-    /// [`FrpSession::identity`].
-    #[must_use]
-    pub fn identity(&self) -> &DeviceIdentity {
-        &self.identity
-    }
-
-    /// [`FrpSession::close`]: raise the `not_armed` blocker and release the
-    /// device. Over BLE that disconnects on btleplug (bounded at 4 s) and
-    /// drops the connection on BlueZ.
-    ///
-    /// # Errors
-    ///
-    /// None today; the signature matches the trait.
-    pub fn close(mut self, out: &mut Events<'_>) -> Result<(), Error> {
-        out.ready(false);
-        (self.release)(self.client.transport_mut().inner_mut());
-        Ok(())
-    }
-
     /// Emit the messages captured since the last call: as `shot.raw` frames
     /// when raw frames are on and they may leave, else as audit lines.
     fn flush_raw(&mut self, out: &mut Events<'_>, connected: bool) {
         for c in self.client.transport_mut().drain() {
-            if !connected || c.private {
-                out.audit(c.dir, &c.label, &c.data);
-            } else if out.wants_raw() {
-                let frame = RawFrame {
-                    timestamp: c.at_ms,
-                    label: Some(c.label),
-                    ..RawFrame::new(c.dir, 0, c.data)
-                };
-                out.frp(FrpBody::ShotRaw(frame));
-            }
+            out.wire(c.dir, c.label, c.data, c.at_ms, !connected || c.private);
         }
     }
 
@@ -521,19 +424,52 @@ impl<T: Transport> R10Session<T> {
     }
 }
 
-impl FrpSession for R10Session {
-    type Driver = R10;
+impl<T: Transport> FrpSession for R10Session<T> {
+    type Error = Error;
+    type Action = NoAction;
 
+    /// Read and handle what the device sends at `now`. Returns
+    /// [`Activity::Active`] after an event or a protocol error, and
+    /// [`Activity::Idle`] once three polls in a row found nothing (a read
+    /// can bring part of a message).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] with the transport error that ended the
+    /// connection.
     fn step(&mut self, now: Instant, out: &mut Events<'_>) -> Result<Activity, Error> {
-        R10Session::step(self, now, out)
+        let capture = out.wants_raw() || out.enabled(Level::Trace);
+        self.client.transport_mut().set_enabled(capture);
+        for _ in 0..IDLE_POLLS {
+            let result = self.client.poll_at(now);
+            self.flush_raw(out, true);
+            match result {
+                Ok(Some(event)) => {
+                    self.handle(event, out);
+                    return Ok(Activity::Active);
+                }
+                Ok(None) => {}
+                Err(e @ crate::Error::Transport(_)) => return Err(e.into()),
+                Err(e) => {
+                    protocol_error(&e, out);
+                    return Ok(Activity::Active);
+                }
+            }
+        }
+        Ok(Activity::Idle)
     }
 
     fn identity(&self) -> &DeviceIdentity {
-        R10Session::identity(self)
+        &self.identity
     }
 
-    fn close(self, out: &mut Events<'_>) -> Result<(), Error> {
-        R10Session::close(self, out)
+    /// Raise the `not_armed` blocker and release the device. Over BLE that
+    /// disconnects on btleplug (bounded at 4 s) and drops the connection on
+    /// BlueZ. Never fails.
+    fn close(mut self, out: &mut Events<'_>) -> Result<(), Error> {
+        out.ready(false);
+        (self.release)(self.client.transport_mut().inner_mut());
+        Ok(())
     }
 }
 
