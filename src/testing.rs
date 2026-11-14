@@ -1,9 +1,8 @@
 //! Frame builders for tests (`testing` feature).
 //!
 //! Builds the bytes a device or host puts on the wire, so a downstream
-//! crate's tests can drive a [`Transport`](crate::Transport) or an
-//! [`IdentityFilter`](crate::capture::IdentityFilter) without knowing the
-//! frame layout. All identity values are synthetic.
+//! crate's tests can drive a [`Transport`](crate::Transport) without
+//! knowing the frame layout. All identity values are synthetic.
 
 use prost::Message;
 

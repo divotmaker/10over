@@ -717,7 +717,7 @@ message LevelCheck {
 
 Some messages carry the device's identity or keys. A raw capture meant to
 leave the machine (a bug report, a shot export) must not contain them.
-`gfdi::carries_identity` and `capture::IdentityFilter` keep them out.
+`gfdi::carries_identity` and `GfdiFrame::carries_identity` classify them.
 
 | Messages | Why they are excluded |
 |---|---|
@@ -728,22 +728,16 @@ leave the machine (a bug report, a shot export) must not contain them.
 | ACK (5000) of any of the above | Dropped with the exchange it answers; a reply's response payload belongs to that exchange |
 | ACK too short to name the type it acknowledges | Cannot be classified |
 
-`IdentityFilter` works on BLE chunks, not frames, because that is what a
-capture records. Classification is by GFDI message type only; protobuf
-payloads are not inspected.
+The driver's raw frames (`driver` feature) follow these rules.
+Classification is by GFDI message type only; protobuf payloads are not
+inspected.
 
-- Every chunk starts with the MultiLink handle byte; the rest is the
+- Each direction's chunks are joined into whole messages: the MultiLink
+  handle byte of every chunk is skipped, and the rest is the
   `0x00`-delimited COBS stream (Section 3).
-- A chunk that leaves no frame open is released at once. A chunk that leaves a
-  frame open is held until the frame's closing `0x00` arrives.
-- When the frame is complete it is COBS-decoded, CRC-checked and classified.
-  If it is safe, the held chunks are released in order. If it carries
-  identity, every chunk holding any of its bytes is dropped, including the
-  chunk carrying its closing delimiter.
-- A frame that cannot be classified is dropped the same way: bad COBS, under
-  6 bytes, a failed CRC, more than 8 KiB of COBS bytes, or still open after
-  256 chunks have been held for it. Past either bound the filter drops
-  every chunk until the next `0x00`, then starts afresh.
-
-A whole chunk is the unit, so a safe frame sharing a chunk with a dropped one
-loses that chunk. Use one filter per direction.
+- A whole message is COBS-decoded, CRC-checked and classified. One that
+  carries identity reaches only the host's trace log, never a `shot.raw`.
+- A message that cannot be classified is withheld the same way: bad COBS,
+  under 6 bytes, a failed CRC, or more than 8 KiB of COBS bytes.
+- Everything before the handshake finished is withheld too, the MultiLink
+  registration included.

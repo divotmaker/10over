@@ -8,9 +8,8 @@
 //!
 //! The public surface is message classification: the `MSG_*` message types,
 //! [`parse_cobs_frame`] and [`carries_identity`]. Callers that record or
-//! forward raw traffic use them (or [`crate::capture::IdentityFilter`],
-//! which is built on them) to keep the device's identity and keys out of
-//! anything they export.
+//! forward raw traffic use them to keep the device's identity and keys out
+//! of anything they export.
 
 use std::ops::RangeInclusive;
 

@@ -6,9 +6,12 @@ use std::io;
 
 use flightrelay::RawDir;
 
-use crate::capture::MAX_FRAME_BYTES;
 use crate::client::Transport;
 use crate::{cobs, gfdi, multilink};
+
+/// Longest COBS-encoded GFDI frame the tap decodes. A longer one is
+/// captured as unparsed, and private.
+const MAX_FRAME_BYTES: usize = 8 * 1024;
 
 /// One message as it crossed the transport.
 #[derive(Debug, Clone, PartialEq, Eq)]

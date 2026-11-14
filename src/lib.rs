@@ -21,7 +21,6 @@ pub mod ble;
 pub mod bluez;
 #[cfg(ble_backend_btleplug)]
 pub mod btleplug;
-pub mod capture;
 pub mod client;
 pub mod cobs;
 #[cfg(feature = "config")]
