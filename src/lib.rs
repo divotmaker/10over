@@ -68,7 +68,11 @@ mod wire_golden;
 #[cfg(feature = "ble")]
 pub use ble::{BleError, BleTransport};
 pub use client::{Client, Event, Transport};
+#[cfg(feature = "config")]
+pub use config::Config;
 pub use error::Error;
+/// The protobuf library, whose `DecodeError` is in [`Error::Protobuf`].
+pub use prost;
 pub use proto::{
     BallData, ClubData, DeviceError, DeviceState, Environment, ErrorCode, ErrorSeverity, ShotData,
     ShotKind, SpinCalcType, SwingData,

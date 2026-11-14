@@ -25,6 +25,8 @@
 //! }
 //! ```
 
+/// The btleplug library, whose `Error` is in [`BtleplugError::Btleplug`].
+pub use ::btleplug;
 use std::future::Future;
 use std::io;
 use std::sync::Arc;

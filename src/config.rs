@@ -9,10 +9,9 @@
 //! use flightrelay::Distance;
 //! use tenover::config::Config;
 //!
-//! let config = Config {
-//!     range: Some(Distance::Feet(7.0)),
-//!     aim_offset_deg: Some(-1.5),
-//! };
+//! let mut config = Config::default();
+//! config.range = Some(Distance::Feet(7.0));
+//! config.aim_offset_deg = Some(-1.5);
 //! config.validate()?;
 //! assert_eq!(config.tee_distance_yd(), Some(7.0 / 3.0));
 //! assert_eq!(config.aim_offset(), -1.5);
@@ -28,6 +27,7 @@ use serde::{Deserialize, Serialize};
 /// Settings of the R10 driver.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[non_exhaustive]
 pub struct Config {
     /// Distance from the device to the tee, sent to the R10 as its tee
     /// distance once it wakes up. Unset leaves the device's own setting
