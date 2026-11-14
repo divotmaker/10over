@@ -430,8 +430,8 @@ pub(crate) struct FragHeader {
 ///
 /// # Errors
 ///
-/// Returns `Err` if the payload is shorter than the header, or than the
-/// header plus the chunk size it declares.
+/// Returns `Err` if the payload is shorter than the header. A chunk size
+/// beyond the payload reads as the rest of the payload.
 pub(crate) fn parse_frag_header(payload: &[u8]) -> Result<(FragHeader, &[u8]), Error> {
     if payload.len() < 14 {
         return Err(Error::FrameTooShort {
@@ -444,14 +444,8 @@ pub(crate) fn parse_frag_header(payload: &[u8]) -> Result<(FragHeader, &[u8]), E
     let total_len = u32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]);
     let chunk_size = u32::from_le_bytes([payload[10], payload[11], payload[12], payload[13]]);
 
-    let min = (chunk_size as usize).saturating_add(14);
-    if min > payload.len() {
-        return Err(Error::FrameTooShort {
-            len: payload.len(),
-            min,
-        });
-    }
-    let pb_data = &payload[14..min];
+    let end = payload.len().min((chunk_size as usize).saturating_add(14));
+    let pb_data = &payload[14..end];
 
     Ok((
         FragHeader {
@@ -612,13 +606,12 @@ mod tests {
     }
 
     #[test]
-    fn a_chunk_size_beyond_the_payload_is_too_short() {
-        let mut payload = vec![0u8; 14];
+    fn a_chunk_size_beyond_the_payload_reads_the_rest() {
+        let mut payload = vec![0u8; 16];
         payload[10..14].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(matches!(
-            parse_frag_header(&payload),
-            Err(Error::FrameTooShort { len: 14, .. })
-        ));
+        payload[14..].copy_from_slice(&[0xab, 0xcd]);
+        let (_, data) = parse_frag_header(&payload).unwrap();
+        assert_eq!(data, [0xab, 0xcd]);
     }
 
     #[test]
