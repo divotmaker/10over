@@ -1,7 +1,7 @@
 //! Convert tenover shot data to FRP types.
 
+use flightrelay::Velocity;
 use flightrelay::types::{ClubData as FrpClubData, Launch};
-use flightrelay::units::Velocity;
 
 use crate::proto::{BallData, ClubData};
 

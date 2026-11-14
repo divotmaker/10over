@@ -6,7 +6,7 @@
 //!
 //! ```
 //! use flightrelay::config::DriverConfig;
-//! use flightrelay::units::Distance;
+//! use flightrelay::Distance;
 //! use tenover::config::Config;
 //!
 //! let config = Config {
@@ -21,8 +21,8 @@
 //! # Ok::<(), flightrelay::config::ConfigError>(())
 //! ```
 
+use flightrelay::Distance;
 use flightrelay::config::{ConfigError, DriverConfig};
-use flightrelay::units::Distance;
 use serde::{Deserialize, Serialize};
 
 /// Settings of the R10 driver.

@@ -3,11 +3,11 @@ use std::collections::VecDeque;
 use std::io;
 use std::rc::Rc;
 
+use flightrelay::Distance;
 use flightrelay::driver::{DeviceEvent, DeviceStatus};
 use flightrelay::testing::{
     TestHost, alerts, bodies, clubs, kinds, launches, raw_frames, status, statuses,
 };
-use flightrelay::units::Distance;
 use flightrelay::{FrpBody, Launch, RawDir, ShotTrigger};
 
 use super::*;
@@ -709,7 +709,7 @@ fn messages_are_captured_only_while_someone_can_receive_them() {
 }
 
 #[test]
-fn audit_lines_do_not_depend_on_raw_frames_being_wanted() {
+fn identity_audit_lines_do_not_depend_on_raw_frames_being_wanted() {
     let run = |wants_raw: bool| {
         let fake = Fake::default();
         let mut rig = Rig::new(wants_raw);
@@ -719,7 +719,11 @@ fn audit_lines_do_not_depend_on_raw_frames_being_wanted() {
         fake.send_envelope(&testing::shot_envelope(9, 3000.0, 2.0));
         rig.poll(&mut session).expect("poll");
         assert!(session.client.transport().enabled());
-        rig.logs(Level::Trace)
+        // The device information messages carry identity; the shot's
+        // messages are audit lines only while raw frames are not wanted.
+        let mut lines = rig.logs(Level::Trace);
+        lines.retain(|l| l.contains(" 13a0 "));
+        lines
     };
     let without = run(false);
     assert_eq!(without, run(true));
