@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   test:
     name: Test
@@ -17,10 +20,27 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+      - run: rustup show
+
       - uses: Swatinem/rust-cache@v2
 
+      - name: Format
+        run: cargo fmt --check
+
       - name: Clippy
-        run: cargo clippy --all-targets --features frp -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Check each feature alone
+        run: |
+          cargo check --no-default-features
+          for f in ble serde config driver frp testing; do
+            cargo check --no-default-features --features "$f"
+          done
 
       - name: Run tests
-        run: cargo test --lib --features frp
+        run: cargo test --all-features
+
+      - name: Docs
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
