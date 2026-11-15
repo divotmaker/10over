@@ -336,7 +336,7 @@ impl<T: Transport> R10Session<T> {
                     Level::Info,
                     format!("shot #{} (device shot {})", key.shot_number, shot.shot_id),
                 );
-                out.shot_trigger(key.clone());
+                out.shot_trigger(key.clone(), None);
                 let aim = self.aim_offset.get();
                 if let Some(ball) = &shot.ball {
                     out.launch(key.clone(), convert::launch(ball, aim));
@@ -450,10 +450,9 @@ impl<T: Transport> FrpSession for R10Session<T> {
     }
 
     /// Release the device. Over BLE that disconnects on btleplug (bounded at
-    /// 4 s) and drops the connection on BlueZ. Never fails.
-    fn close(mut self, _: &mut Events<'_>) -> Result<(), Error> {
+    /// 4 s) and drops the connection on BlueZ.
+    fn close(mut self, _: &mut Events<'_>) {
         (self.release)(self.client.transport_mut().inner_mut());
-        Ok(())
     }
 }
 

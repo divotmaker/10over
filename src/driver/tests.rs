@@ -131,8 +131,8 @@ impl Rig {
     }
 
     /// Close the session.
-    fn close(&mut self, session: R10Session<Fake>) -> Result<(), Error> {
-        self.host.with(|_, out| session.close(out))
+    fn close(&mut self, session: R10Session<Fake>) {
+        self.host.with(|_, out| session.close(out));
     }
 
     /// Take the events seen so far.
@@ -621,7 +621,7 @@ fn close_releases_the_device() {
         .establish(&mut d, &fake, Fake::release)
         .expect("handshake");
     assert_eq!(fake.0.borrow().released, 0);
-    rig.close(session).expect("close");
+    rig.close(session);
     assert_eq!(fake.0.borrow().released, 1);
 }
 
