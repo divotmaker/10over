@@ -240,7 +240,10 @@ fn shot_sends_each_event_once_and_numbers_keep_counting() {
     let mut session = armed(&mut rig, &mut d, &fake);
     assert_eq!(
         status(&rig.take()),
-        DeviceStatus::new().with_telemetry("device_state", "waiting")
+        DeviceStatus::new()
+            .with_telemetry("device_state", "waiting")
+            .with_telemetry("tilt", "unknown")
+            .with_telemetry("roll", "unknown")
     );
 
     fake.send_envelope(&testing::shot_envelope(41, 2800.0, 5.0));
@@ -257,7 +260,8 @@ fn shot_sends_each_event_once_and_numbers_keep_counting() {
     assert_eq!(*timestamp, None, "the R10 has no wall clock");
     let after = status(&events);
     assert_eq!(after.blockers, ["not_armed"]);
-    assert_eq!((after.tilt, after.roll), (None, None));
+    assert_eq!(after.telemetry["tilt"], "unknown");
+    assert_eq!(after.telemetry["roll"], "unknown");
     let launch = launches(&events)[0];
     assert_eq!(launch.total_spin_rpm, Some(2800));
     // The wire's tilt of 5 is 5° left: the axis and sidespin are negative.
@@ -381,21 +385,53 @@ fn a_new_aim_offset_applies_to_the_running_session() {
 }
 
 #[test]
-fn a_shot_takes_a_leveling_reading_off_the_actor() {
+fn a_not_level_reading_is_flagged_until_the_device_arms_or_takes_a_shot() {
     let fake = Fake::default();
     let mut rig = Rig::new(false);
     let mut d = driver(None);
     let mut session = armed(&mut rig, &mut d, &fake);
-    rig.take();
+    let mut seen = rig.take();
+    // Poll what `envelopes` queued; the tilt, roll and flags after it.
+    let mut after = |envelopes: &[Vec<u8>]| {
+        for e in envelopes {
+            fake.send_envelope(e);
+        }
+        rig.poll(&mut session).expect("poll");
+        let events = rig.take();
+        let s = status(&events);
+        seen.extend(events);
+        (
+            s.telemetry["tilt"].clone(),
+            s.telemetry["roll"].clone(),
+            s.flagged.into_iter().collect::<Vec<_>>(),
+        )
+    };
+    let level = |tilt: &str, roll: &str, flagged: &[&str]| {
+        let flagged = flagged.iter().map(|&k| k.to_owned()).collect();
+        (tilt.to_owned(), roll.to_owned(), flagged)
+    };
+    let not_level = testing::error_envelope(3, 2, Some((4.5, -6.25)));
 
-    fake.send_envelope(&testing::error_envelope(3, 2, Some((4.5, -6.25))));
-    rig.poll(&mut session).expect("poll");
-    let level = status(&rig.take());
-    assert_eq!((level.tilt, level.roll), (Some(-6.25), Some(4.5)));
-    fake.send_envelope(&testing::shot_envelope(3, 2800.0, 5.0));
-    rig.poll(&mut session).expect("poll");
-    let after = status(&rig.take());
-    assert_eq!((after.tilt, after.roll), (None, None));
+    // The not-level error flags both; arming again takes the flags off.
+    let flagged = level("-6.2°", "4.5°", &["roll", "tilt"]);
+    assert_eq!(after(std::slice::from_ref(&not_level)), flagged);
+    let rearm = [testing::state_envelope(3), testing::state_envelope(2)];
+    assert_eq!(after(&rearm), level("unknown", "unknown", &[]));
+    // Another error with a reading is not flagged: the device decides.
+    let saturated = testing::error_envelope(2, 0, Some((0.0, -0.04)));
+    assert_eq!(after(&[saturated]), level("0.0°", "0.0°", &[]));
+    // A shot takes the reading and its flags off.
+    assert_eq!(after(&[not_level]), flagged);
+    let shot = testing::shot_envelope(3, 2800.0, 5.0);
+    assert_eq!(after(&[shot]), level("unknown", "unknown", &[]));
+
+    // Every state's actor carries the same, declared keys.
+    let info = R10::info(&Config::default());
+    for status in statuses(&seen) {
+        let actor = info.bus_actor("x", Duration::from_secs(2), None, &status);
+        let keys: Vec<String> = actor.telemetry.expect("telemetry").into_keys().collect();
+        assert_eq!(keys, ["device_state", "roll", "tilt"]);
+    }
 }
 
 #[test]
@@ -413,19 +449,34 @@ fn states_and_errors_become_status_and_alerts() {
     fake.send_envelope(&testing::error_envelope(2, 0, None));
     rig.poll(&mut session).expect("poll");
     let events = rig.take();
+    // As the actor carries them: a key not reported has its declared value.
+    let info = R10::info(&Config::default());
     let seen: Vec<_> = statuses(&events)
         .into_iter()
-        .map(|s| (s.telemetry["device_state"].clone(), s.tilt, s.roll))
+        .map(|s| {
+            let actor = info.bus_actor("x", Duration::from_secs(2), None, &s);
+            let t = actor.telemetry.expect("telemetry");
+            (
+                t["device_state"].clone(),
+                t["tilt"].clone(),
+                t["roll"].clone(),
+            )
+        })
         .collect();
-    let state = |label: &str, tilt, roll| (label.to_owned(), tilt, roll);
+    let state =
+        |label: &str, tilt: &str, roll: &str| (label.to_owned(), tilt.to_owned(), roll.to_owned());
     assert_eq!(
         seen,
         [
-            state("recording", None, None),
-            state("processing", None, None),
-            state("processing", Some(-6.25), Some(4.5)),
-            // An error without a reading takes the attitude off.
-            state("processing", None, None),
+            state("recording", "unknown", "unknown"),
+            state("processing", "unknown", "unknown"),
+            state("processing", "-6.2°", "4.5°"),
+            state("processing", "-6.2°", "4.5°"),
+            state("processing", "-6.2°", "4.5°"),
+            // An error without a reading: the reading no longer holds.
+            state("processing", "unknown", "unknown"),
+            state("processing", "unknown", "unknown"),
+            state("processing", "unknown", "unknown"),
         ]
     );
     let alerts: Vec<_> = alerts(&events)

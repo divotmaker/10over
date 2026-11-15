@@ -11,8 +11,10 @@
 //!
 //! What a session emits:
 //!
+//! - the phase `discovering` while it searches, `handshaking`, then
+//!   `measuring` once the session is up;
 //! - no status until the device arms (the host starts every session with
-//!   the `not_armed` blocker);
+//!   the `not_armed` blocker, and each telemetry key `"unknown"`);
 //! - when the device arms, no blockers and the telemetry key
 //!   `device_state=waiting`; as it records and processes a shot,
 //!   `device_state=recording` and `processing`;
@@ -21,7 +23,10 @@
 //!   [`convert::launch`]), `shot.club` when the device tracked the club,
 //!   `shot.finished`, then the `not_armed` blocker until it arms again;
 //! - a device error as a `bus.alert`; one that carries the device's tilt
-//!   sets the attitude (`tilt` is the pitch, `roll` the roll, in degrees);
+//!   sets the telemetry keys `tilt` (the pitch) and `roll` (the roll), in
+//!   degrees with one decimal (`"-6.2°"`), both flagged while the error is
+//!   the device's not-level error. Arming, each shot and an error without a
+//!   reading set both to `"unknown"` and take the flags off;
 //! - `shot.raw` frames while the host turns them on: one per GFDI message,
 //!   labeled `"<notify|write> <message type, hex>"`. Messages that carry the
 //!   device's identity or keys, messages that cannot be classified, and
@@ -57,7 +62,7 @@ use flightrelay::{RawFrame, Severity, Source};
 use crate::ble::{BleError, BleTransport};
 use crate::client::{Client, Event, Transport};
 use crate::config::Config;
-use crate::proto::{DeviceState, ErrorSeverity};
+use crate::proto::{DeviceState, ErrorCode, ErrorSeverity};
 
 use raw::Tap;
 
@@ -166,6 +171,7 @@ impl R10 {
             match result {
                 Ok(Some(Event::HandshakeComplete)) => {
                     ctx.out.log(Level::Info, "handshake complete");
+                    ctx.out.phase("measuring");
                     return Ok(session);
                 }
                 Ok(Some(event)) => {
@@ -201,6 +207,11 @@ impl FrpDriver for R10 {
             .with_manufacturer("Garmin")
             .exclusive()
             .with_raw(RawProfile::new("r10-ble", 256, 256, 0, no_bulk, false))
+            .with_telemetry(&[
+                ("device_state", "unknown"),
+                ("tilt", "unknown"),
+                ("roll", "unknown"),
+            ])
     }
 
     fn new(config: Config) -> Result<Self, ConfigError> {
@@ -326,7 +337,7 @@ impl<T: Transport> R10Session<T> {
             Event::Ready => {
                 out.log(Level::Info, "armed, waiting for shots");
                 // A level reading from an earlier error no longer holds.
-                out.attitude(None, None);
+                level(out, "unknown", "unknown", false);
                 out.ready(true);
                 out.telemetry([("device_state", "waiting")]);
             }
@@ -345,7 +356,7 @@ impl<T: Transport> R10Session<T> {
                     out.club(key.clone(), convert::club_data(club, aim));
                 }
                 out.shot_finished(key);
-                out.attitude(None, None);
+                level(out, "unknown", "unknown", false);
                 out.ready(false);
             }
             Event::StateChange(state) => {
@@ -370,10 +381,12 @@ impl<T: Transport> R10Session<T> {
                 let mut message = format!("R10: {:?}", err.code);
                 if let Some((roll, pitch)) = err.tilt {
                     let _ = write!(message, " (roll={roll:.1}, pitch={pitch:.1})");
-                    out.attitude(degrees(pitch), degrees(roll));
+                    // The device decides when it is not level.
+                    let not_level = err.code == ErrorCode::NotLevel;
+                    level(out, &degrees(pitch), &degrees(roll), not_level);
                 } else {
-                    // An error without a reading takes the last one off.
-                    out.attitude(None, None);
+                    // An error without a reading: the last one no longer holds.
+                    level(out, "unknown", "unknown", false);
                 }
                 out.log(Level::Warn, message.clone());
                 out.alert(severity, message);
@@ -456,10 +469,19 @@ impl<T: Transport> FrpSession for R10Session<T> {
     }
 }
 
-/// An angle from the device as `f64`, with the decimal value the `f32`
-/// prints as (4.3, not 4.300000190734863).
-fn degrees(angle: f32) -> f64 {
-    angle.to_string().parse().unwrap_or(f64::from(angle))
+/// The `tilt` and `roll` telemetry, both flagged or neither.
+fn level(out: &mut Events<'_>, tilt: &str, roll: &str, flagged: bool) {
+    out.telemetry([("tilt", tilt), ("roll", roll)]);
+    out.flag("tilt", flagged);
+    out.flag("roll", flagged);
+}
+
+/// An angle from the device as telemetry: degrees with one decimal, as the
+/// alert prints it, and a degree sign (`"4.3°"`); never negative zero.
+fn degrees(angle: f32) -> String {
+    let text = format!("{angle:.1}");
+    let text = if text == "-0.0" { "0.0" } else { &text };
+    format!("{text}°")
 }
 
 #[cfg(test)]
