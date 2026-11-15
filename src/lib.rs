@@ -71,6 +71,9 @@ pub use client::{Client, Event, Transport};
 #[cfg(feature = "config")]
 pub use config::Config;
 pub use error::Error;
+/// The flightrelay SDK this crate was built with, so callers name its types at the same version.
+#[cfg(feature = "config")]
+pub use flightrelay;
 /// The protobuf library, whose `DecodeError` is in [`Error::Protobuf`].
 pub use prost;
 pub use proto::{
