@@ -11,7 +11,8 @@
 //!
 //! What a session emits:
 //!
-//! - after the handshake, the `not_armed` blocker;
+//! - no status until the device arms (the host starts every session with
+//!   the `not_armed` blocker);
 //! - when the device arms, no blockers and the telemetry key
 //!   `device_state=waiting`; as it records and processes a shot,
 //!   `device_state=recording` and `processing`;
@@ -165,7 +166,6 @@ impl R10 {
             match result {
                 Ok(Some(Event::HandshakeComplete)) => {
                     ctx.out.log(Level::Info, "handshake complete");
-                    ctx.out.ready(false);
                     return Ok(session);
                 }
                 Ok(Some(event)) => {

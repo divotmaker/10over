@@ -228,7 +228,8 @@ fn handshake_identifies_the_r10_and_keeps_its_messages_private() {
     assert!(audit.iter().any(|l| l.starts_with("tx write 1388 ")));
     let events = rig.take();
     assert!(raw_frames(&events).is_empty(), "{events:?}");
-    assert_eq!(statuses(&events), [DeviceStatus::not_armed()]);
+    // The host starts every session `not_armed`; the driver adds nothing.
+    assert!(statuses(&events).is_empty(), "{events:?}");
 }
 
 #[test]
