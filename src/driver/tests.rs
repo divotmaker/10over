@@ -298,7 +298,7 @@ fn zero_spin_shot_sends_total_zero_with_no_axis() {
 }
 
 /// The first launch and club data of one shot (device shot 5).
-fn aimed_shot(d: &mut R10, envelope: &[u8]) -> (Launch, flightrelay::types::ClubData) {
+fn aimed_shot(d: &mut R10, envelope: &[u8]) -> (Launch, flightrelay::ClubData) {
     let fake = Fake::default();
     let mut rig = Rig::new(false);
     let mut session = armed(&mut rig, d, &fake);
