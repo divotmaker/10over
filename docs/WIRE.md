@@ -590,7 +590,7 @@ message SwingTiming {
 | attack_deg | degrees | Angle of attack |
 | swing timing | ms | Absolute timestamps (ms since device boot) |
 
-### 9.6 Observations from Live Device
+### 9.6 Device Behavior
 
 - Club face/path/attack angle all 0.0 on slow swings — R10 needs minimum club
   speed to track club data

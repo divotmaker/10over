@@ -55,14 +55,12 @@ This project is an exercise of the interoperability exception under
 The Garmin R10 uses a proprietary protocol over Bluetooth Low Energy to
 communicate shot data (ball speed, launch angle, spin, club data, etc.) to
 companion software. Garmin does not publish this protocol or provide an SDK for
-third-party integration. The protocol was worked out from the researcher's own
-lawfully purchased device and from analysis of the official Garmin Golf app,
-solely to enable interoperability with third-party golf simulation software.
+third-party integration. This project exists solely to enable interoperability
+with third-party golf simulation software.
 
 No Garmin code is reproduced here; the protocol is described and implemented in
 our own words, and the protobuf schema uses our own message and field names. No
-access controls were circumvented — the device uses standard BLE bonding, and
-all protocol data was captured from the researcher's own device.
+access controls are circumvented — the device uses standard BLE bonding.
 
 ## Acceptable Use
 
@@ -90,7 +88,7 @@ at your option.
 ## Status
 
 Verified against a **Garmin Approach R10** on Windows. Pre-1.0 (`0.x`): the
-protocol is reverse-engineered and still being mapped, so the API may change as
+protocol is still being mapped, so the API may change as
 new message types are decoded and existing ones are refined. This crate follows
 [SemVer](https://semver.org/): until `1.0`, breaking changes bump the minor version.
 
@@ -101,10 +99,28 @@ protocol (FRP 0.3.0) and the device's behavior are unchanged.
 
 | | 0.6 | 0.7 |
 |---|---|---|
-| Session entry point | `R10Session::poll(timeout, out)`, which reads and sleeps until `timeout` | `R10Session::step(now, out) -> Activity`, one pass at `now`: `Activity::Active` after an event, `Activity::Idle` when the device is quiet. `FrpSession::poll` is flightrelay's loop over `step` |
+| Session entry point | `R10Session::poll(timeout, out)`, which reads and sleeps until `timeout` | `R10Session::step(now, out) -> Activity`, one pass at `now`: `Activity::Active` after an event, `Activity::Idle` when the device is quiet. a host calls `step` in a loop |
 | Handshake timing | 10 s on the wall clock | 10 s of the host's time (`ConnectCtx::now`); every pass ticks the host, and a quiet pass waits through `ConnectCtx::wait` |
 | Shot deduplication | `Client::poll` | adds `Client::poll_at(now)`; `poll` is `poll_at(Instant::now())` |
 | A session from `R10::connect_with` (`testing`) | stepped with `poll(timeout, out)` in real time | stepped with `step(now, out)`, e.g. through flightrelay's `testing::TestHost` in virtual time |
+| Tilt and roll | fields of the `device` block of `bus.actor` | telemetry keys `tilt` and `roll` (`unknown` when not reported), flagged while the device reports it is not level |
+
+Also in 0.7:
+
+- Import the types from the crate root: `tenover::{Client, Event, Transport,
+  Error, ShotData, BallData, ClubData, SwingData, ShotKind, SpinCalcType,
+  DeviceState, DeviceError, ErrorCode, ErrorSeverity, Environment}`. The
+  `client`, `error`, `proto`, `cobs`, `crc`, `multilink` and `capture` modules
+  are no longer public.
+- `capture::IdentityFilter` is removed; the driver's raw frames already leave
+  identity-bearing messages out.
+- The envelope builders, `decode_envelope` and `EnvelopeEvent` are internal:
+  use `Client`.
+- `Event`, `Error`, `BleError`, `BleTransport` and the shot data types are
+  `#[non_exhaustive]`: add a `_` arm to matches. `Error::Cobs` has no payload.
+- `R10Session` implements `FrpSession` for any `Transport` (there are no
+  inherent `step`/`close`). A failed connect's alert is the error text,
+  without the "R10 connection error: " prefix.
 
 ## Migrating from 0.5
 
@@ -145,42 +161,6 @@ cannot handshake, so controllers move to FRP 0.2.0 too.
 | btleplug scan output | printed to stderr | progress lines go to the `log` callback |
 | btleplug close | the peripheral stays connected until it next sends | dropping the transport (or `BleTransport::disconnect`) disconnects it, waiting at most 4 s |
 | BlueZ `auto_connect` | D-Bus calls without a timeout | each D-Bus call times out after 3 s; a `Connect` that times out is waited for, up to 30 s; a connect it started is undone if setup fails |
-
-## Migrating from 0.2
-
-0.3.0 renames public items so the API says what the R10 does. Behavior and
-wire bytes are unchanged; only names moved.
-
-| 0.2 | 0.3 |
-|-----|-----|
-| `proto::SmartEvent` | `proto::EnvelopeEvent` |
-| `proto::decode_smart` | `proto::decode_envelope` |
-| `proto::ShotConfig` | `proto::Environment` |
-| `proto::build_shot_config_request` | `proto::build_environment_request` |
-| `Client::send_shot_config` | `Client::send_environment` |
-| `SmartEvent::LaunchMonitorResponse` | `EnvelopeEvent::MonitorReply` |
-| `DeviceState::InterferenceTest` | `DeviceState::NoiseCheck` |
-| `PlatformTilted` (error-code variant) | `NotLevel` |
-| `SpinCalcType::Ratio` | `SpinCalcType::Estimated` |
-| `SpinCalcType::BallFlight` | `SpinCalcType::FlightModel` |
-
-Also renamed:
-
-- The reply variants of `EnvelopeEvent` for the subscribe, wake, environment
-  and leveling-check exchanges are now `SubscribeResult`, `WakeResult`,
-  `EnvironmentResult` and `LevelCheck { verdict, attempt }` (the last replaces
-  the calibration-report variant).
-- The wake and environment reply variants of `client::Event` are now
-  `Event::WakeResult` and `Event::EnvironmentResult`.
-- The shot-type enum with the variants `Practice` and `Normal` is now
-  `ShotKind` with `Warmup` and `Regular`, and `ShotData` carries it in the field
-  `kind` (it was the shot-type field).
-- The tee-distance field of `Environment` is now `tee_distance_yd`.
-
-The `proto::smart`, `proto::event_sharing` and `proto::launch_monitor` modules
-(the generated protobuf types) are no longer public. Use the types above
-together with `ShotData`, `DeviceState`, `DeviceError`, `build_subscribe_request`
-and `build_wakeup_request`.
 
 ## Protocol Documentation
 
@@ -293,9 +273,12 @@ What the actor publishes over FRP:
 - `bus.actor` with the role `launch_monitor` and a `device` block with
   `source: "measured"`, manufacturer `Garmin` and model `R10`; `blockers`
   holds `not_armed` until the device arms and again from each shot until it
-  arms again; the telemetry key `device_state` (`waiting`, `recording`,
-  `processing`); and `tilt`/`roll`, the angles the device reports with a
-  leveling error;
+  arms again; the telemetry keys `device_state` (`waiting`, `recording`,
+  `processing`; `unknown` until the device arms) and `tilt` (pitch) and
+  `roll`: `unknown` until the device reports a leveling error with angles,
+  then degrees with one decimal (e.g. `-6.2°`), both flagged while it is the
+  not-level error, and `unknown` again when the device arms, takes a shot or
+  reports an error without angles;
 - per shot: `shot.trigger`, `shot.launch` (launch speed, both launch angles,
   and total spin, spin axis, backspin and sidespin, all measured; a total
   spin of 0 is sent as 0 with no axis), `shot.club` (club speed, face, path,
@@ -334,32 +317,14 @@ cargo build --no-default-features --features config --target wasm32-unknown-unkn
 cargo build --features frp
 ```
 
-## Recording raw traffic
+## Raw frames and identity
 
-Tools that record the raw BLE chunks a `Transport` carries (for a bug report or
-a shot export) can keep the device's identity out of the recording:
-
-- `gfdi::carries_identity(msg_type)` says whether a message type carries the
-  device's identity or keys: device information (unit ID, Bluetooth names), FIT
-  and file transfer (FIT files carry the device serial) and authentication.
-  `GfdiFrame::carries_identity()` also covers an ACK of one of those types.
-- `capture::IdentityFilter` is fed one direction's chunks in order and returns
-  only the chunks cleared for recording. It holds a chunk until every frame it
-  touches is complete, and drops every chunk holding a byte of an
-  identity-bearing frame or of a frame it cannot classify.
-
-```rust
-use tenover::capture::IdentityFilter;
-
-let mut rx = IdentityFilter::new();
-for chunk in chunks {
-    for cleared in rx.feed(&chunk, chunk.clone()) {
-        record(cleared);
-    }
-}
-```
-
-See [WIRE.md §15](docs/WIRE.md#15-identity-in-raw-captures) for the rules.
+`gfdi::carries_identity(msg_type)` says whether a message type carries the
+device's identity or keys: device information (unit ID, Bluetooth names), FIT
+and file transfer (FIT files carry the device serial) and authentication.
+`GfdiFrame::carries_identity()` also covers an ACK of one of those types. The
+driver's `shot.raw` frames leave all of them out; see
+[WIRE.md §15](docs/WIRE.md#15-identity-in-raw-captures).
 
 ## Dependencies
 
